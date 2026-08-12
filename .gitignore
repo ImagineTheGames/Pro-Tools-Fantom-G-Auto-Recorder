@@ -1,0 +1,43 @@
+# --- never publish -----------------------------------------------------------
+
+# Avid's PTSL SDK is licensed and cannot be redistributed. Every user must
+# download their own copy from developer.avid.com/scripting.
+*.proto
+PTSL_SDK*/
+ptsl_sdk/
+
+# Music. Songs, exports and their cue sheets belong to whoever made them.
+*.mid
+*.midi
+*.smf
+*.SVQ
+*.SVP
+*.SVA
+*_cues.csv
+
+# Recorded audio and disk images
+*.wav
+*.aif
+*.aiff
+*.img
+
+# --- ordinary noise ----------------------------------------------------------
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.egg-info/
+
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# local overrides
+config.local.*
+*.local.json
