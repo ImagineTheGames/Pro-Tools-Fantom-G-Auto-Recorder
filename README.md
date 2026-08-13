@@ -72,6 +72,30 @@ Microsoft's own signed driver. Reversible from Device Manager.
     python fantom_stem.py run song.mid --port "Fantom"
         Perform the capture pass.
 
+## Stopping a capture
+
+    .\Stop-Capture.ps1
+
+Safe at any time, including when nothing is wrong. A crashed or abandoned
+capture leaves three things behind, and this clears all of them in the order
+that matters:
+
+1. **Pro Tools still rolling and record-armed.** It will record over the next
+   take, or fill a drive. Stopped first, then every track is disarmed.
+2. **Orphaned processes** — `fantom_stem.py run` and its `ptools.js serve`
+   client. Matched on command line, never on image name: killing every
+   `node.exe` would take out unrelated tools.
+3. **The Fantom still sounding**, because the note-offs never got sent.
+   Silenced last, deliberately — the running capture owns the USB endpoint,
+   so `panic.py` cannot open it until that process is gone.
+
+`-KeepProcesses` stops the transport but leaves a running take alone.
+`-NoPanic` leaves the synth sounding.
+
+If the Fantom is still making noise afterwards, press STOP on the
+instrument or turn it down — nothing on the computer can reach it once USB
+is unavailable.
+
 ## Options for plan / run
 
     --parts 1,3,7       Only these parts (default: all)
