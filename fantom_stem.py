@@ -941,12 +941,12 @@ def cmd_tab(args):
             continue
         cut = max(0.0, tr - offset)
         off = cut - med
-        # The group check only means something under --grid, where every track
-        # is expected to cut by the same rig latency. Plain tab to transient
-        # cuts each track to ITS OWN attack, so a part that starts a beat into
-        # the loop is supposed to cut a beat more than its neighbours -- and
-        # measuring that against the group threw those tracks out.
-        if args.grid and abs(off) > args.tolerance:
+        # Off by default. Parts genuinely start at different times -- different
+        # notes, different lengths -- so a cut far from the group median is
+        # normal, not evidence of a bad measurement. Skipping those tracks left
+        # them untrimmed while everything around them moved, which is worse
+        # than trimming them. Pass --tolerance to bring the check back.
+        if args.grid and args.tolerance > 0 and abs(off) > args.tolerance:
             note = "%+.0f ms vs group - skipped" % (1000.0 * off)
             print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
             continue
@@ -1325,6 +1325,64 @@ def run_per_track(song, keys, args):
 
     print("\n  Done. %d track(s) recorded, each starting at timeline zero." % made)
 
+    if made and not args.no_trim:
+        trim_after_capture(args)
+
+
+def trim_after_capture(args):
+    """
+    Trim every recorded stem to its own first attack, for real.
+
+    Runs the same path as `fantom_stem.py tab`, with --fill and --yes: no dry
+    run, no confirmation, no group-median skipping. A part that starts seconds
+    later than its neighbours is a part that starts later, not a bad
+    measurement, and leaving it untrimmed while everything around it moves is
+    the worse outcome.
+    """
+    session = args.session or session_path_from_protools()
+    if not session:
+        print("\n  Head trim skipped: no Pro Tools session folder known.")
+        print("  Pass --session <folder> to trim automatically after a capture.")
+        return
+
+    print("\n  Trimming heads to the first attack...\n")
+
+    ns = argparse.Namespace(
+        session=session,
+        grid=args.file,          # parts that do not start on beat 1 keep their offset
+        guard=0.0,
+        snap=False,
+        tolerance=0.0,           # never skip a track for differing from the group
+        fill=True,               # no detectable attack -> cut the group median
+        tracks=None,
+        dry_run=False,
+        yes=True,
+    )
+    try:
+        cmd_tab(ns)
+    except SystemExit as e:
+        # cmd_tab exits when nothing is measurable; that must not kill the pass.
+        if e.code:
+            print("  Head trim: %s" % e.code)
+    except Exception as e:
+        print("  Head trim failed: %s" % e)
+
+
+def session_path_from_protools():
+    """The open session's folder, asked of Pro Tools itself."""
+    try:
+        from protools import Session
+        pt = Session()
+        try:
+            folder = (pt.send("session-path") or {}).get("folder") or ""
+        finally:
+            pt.close()
+        if folder and os.path.isdir(folder):
+            return folder
+    except Exception:
+        pass
+    return None
+
 
 def cmd_run(args):
     song = Song(args.file)
@@ -1505,9 +1563,10 @@ def main():
     tb.add_argument("--snap", action="store_true",
                     help="cut at the note's playing level rather than the foot of "
                          "its attack; tighter, but it removes the leading edge")
-    tb.add_argument("--tolerance", type=float, default=0.15,
+    tb.add_argument("--tolerance", type=float, default=0.0,
                     help="skip tracks whose cut differs from the group median by "
-                         "more than this many seconds (default 0.15)")
+                         "more than this many seconds. 0 (the default) never "
+                         "skips: every track is trimmed to its own attack")
     tb.add_argument("--fill", action="store_true",
                     help="for tracks with no detectable attack, cut the group median")
     tb.add_argument("--tracks", metavar="NAME", nargs="+",
@@ -1593,6 +1652,13 @@ def main():
     r.add_argument("--tail", type=float, default=4.0,
                    help="seconds to keep recording after the last note, so reverb and "
                         "delay tails are captured (per-track mode, default 4.0)")
+    r.add_argument("--no-trim", action="store_true",
+                   help="leave the capture lead at the head of every take. By default a "
+                        "finished pass trims each stem to its own first attack and packs "
+                        "it to timeline zero")
+    r.add_argument("--session", metavar="FOLDER",
+                   help="Pro Tools session folder, for the post-capture trim. Asked of "
+                        "Pro Tools directly when not given")
     r.set_defaults(func=cmd_run)
 
     args = ap.parse_args()

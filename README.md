@@ -57,14 +57,17 @@ up and everything else stays correct.
 
 ## After the capture
 
+**The trim runs by itself.** A finished `--per-track` pass pulls every stem
+it recorded back to its own first attack and packs it to timeline zero — no
+dry run, no prompt. `--no-trim` leaves the lead in place.
+
     python fantom_stem.py verify   <session>   # measure every take
     python fantom_stem.py session  <session>   # what is on the timeline
     python fantom_stem.py tab      <session> --grid song.mid --dry-run
 
-`tab` pulls each stem's first attack to timeline zero — tab to transient,
-split, delete the left, shift left. `--grid` keeps parts that do not begin
-on beat 1 where they belong. The console's `A` key runs it with a preview
-and asks before applying.
+`tab` is the same trim on demand: tab to transient, split, delete the left,
+shift left. `--grid` keeps parts that do not begin on beat 1 where they
+belong. The console's `A` key runs it with a preview first.
 
 `align` does the same job by trimming the shared capture lead, using the
 **smallest** lead in the group so it can never cut into the earliest part.

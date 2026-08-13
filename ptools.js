@@ -22,6 +22,7 @@
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as readline from 'readline';
 
 const PROTO = process.env.PTSL_PROTO_PATH ||
@@ -30,6 +31,7 @@ const ADDR = process.env.PTSL_ADDR || 'localhost:31416';
 
 const CMD = {
   GetTrackList: 3,
+  GetSessionPath: 43,
   SelectAllClipsOnTrack: 4,
   SetPlaybackMode: 32,
   SetRecordMode: 33,
@@ -164,6 +166,13 @@ async function waitFor(pred, tries = 100, ms = 10) {
 /** One command, shared by serve() and the CLI. */
 async function handle(req) {
   switch (req.cmd) {
+    // The session FOLDER, so a capture can find its own audio files without
+    // being told where they are. PTSL returns the .ptx file path.
+    case "session-path": {
+      const r = await send(CMD.GetSessionPath);
+      const file = (r.session_path && r.session_path.path) || "";
+      return { path: file, folder: file ? path.dirname(file) : "" };
+    }
     case "ensure-track": {
       const cur = await send(CMD.GetTrackList, { page_limit: 400 });
       if ((cur.track_list || []).some(t => t.name === req.name)) return { created: false };

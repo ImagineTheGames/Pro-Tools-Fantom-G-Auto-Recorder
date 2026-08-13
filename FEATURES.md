@@ -18,6 +18,7 @@ This list is derived from the code, not from memory. To regenerate it:
 
 | Where | What |
 | --- | --- |
+| **automatic** | A finished `run --per-track` pass trims every stem it recorded. No dry run, no prompt. `--no-trim` opts out |
 | `fantom_stem.py tab` | Tab to transient, split, delete left, shift left — on every track |
 | `fantom_stem.py align` | Trim the capture lead so bar 1 lands on bar 1 |
 | Console key `A` | Runs `tab` with `--grid`, shows a dry run, asks before applying |
@@ -39,6 +40,11 @@ Notes that matter:
   it can never cut into the earliest part.
 - Detection reads the recorded WAV. It does not depend on driving the
   Pro Tools UI.
+- Every track gets trimmed to its own attack. `--tolerance` defaults to 0,
+  which never skips: parts genuinely start at different times, and leaving
+  one untrimmed while everything around it moves is the worse outcome.
+- The session folder is asked of Pro Tools (`session-path`), so the trim
+  finds its own audio files without being told where they are.
 
 ## Capture
 
