@@ -913,14 +913,19 @@ def cmd_tab(args):
     med = sorted(found)[len(found) // 2]
 
     todo = []
+    skipped = []          # (stem, why) - every one of these gets reported
     for stem, t, tr, offset, note in plan:
         # Filtering happens here, not during the scan: the group median is only
         # meaningful if it was taken across the whole session.
         if args.tracks and stem not in args.tracks:
             continue
         # A take whose track is gone from the session is just a file left on
-        # disk. Editing it is impossible and listing it is noise.
+        # disk. Editing it is impossible -- but say so, because a track that
+        # silently vanishes from the report is indistinguishable from a bug.
         if stem not in clip_len:
+            skipped.append((stem, "no clip on the timeline - take file only"))
+            print("  %-22s %10s %10s %10s  not on the timeline"
+                  % (stem[:22], "-", "-", "-"))
             continue
         gone = len(t.samples) - clip_len[stem]
         if tr is None:
@@ -934,9 +939,11 @@ def cmd_tab(args):
                     print("  %-22s %10s %9.3fs %9.3fs  no attack - group median"
                           % (stem[:22], "-", offset, samples / float(t.rate)))
                 else:
+                    skipped.append((stem, "no attack found, and already trimmed"))
                     print("  %-22s %10s %9.3fs %10s  no attack - already trimmed"
                           % (stem[:22], "-", offset, "-"))
             else:
+                skipped.append((stem, note or "no attack found"))
                 print("  %-22s %10s %10s %10s  %s" % (stem[:22], "-", "-", "-", note))
             continue
         cut = max(0.0, tr - offset)
@@ -948,6 +955,7 @@ def cmd_tab(args):
         # than trimming them. Pass --tolerance to bring the check back.
         if args.grid and args.tolerance > 0 and abs(off) > args.tolerance:
             note = "%+.0f ms vs group - skipped" % (1000.0 * off)
+            skipped.append((stem, note))
             print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
             continue
         samples = int(round(cut * t.rate)) - gone
@@ -958,6 +966,7 @@ def cmd_tab(args):
                     note += " - %.0f ms PAST this point" % (-1000.0 * samples / t.rate)
             else:
                 note = "already at zero"
+            skipped.append((stem, note))
             print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
             continue
         todo.append((stem, samples, samples / float(t.rate)))
@@ -974,6 +983,7 @@ def cmd_tab(args):
                   "their offset." % len(late))
 
     if not todo:
+        trim_summary([], skipped, [])
         return
     if args.dry_run:
         print("\n  Dry run. Re-run without --dry-run to apply.")
@@ -983,18 +993,58 @@ def cmd_tab(args):
         return
 
     print()
-    done = failed = 0
+    trimmed, failures = [], []
     with Session() as pt:
-        for stem, samples, cut in todo:
+        try:
+            for stem, samples, cut in todo:
+                try:
+                    r = pt.separate_head(stem, samples)
+                    trimmed.append((stem, cut, r["start"]))
+                    print("  %-22s separated at %.3f s, kept the right side, packed to %d"
+                          % (stem[:22], cut, r["start"]))
+                except ProToolsError as e:
+                    failures.append((stem, str(e)))
+                    print("  %-22s FAILED: %s" % (stem[:22], e))
+        finally:
+            # separate_head puts the session in Shuffle so the survivor packs
+            # left on its own. Leaving it there is a trap: the next edit the
+            # user makes by hand ripples the whole timeline.
             try:
-                r = pt.separate_head(stem, samples)
-                done += 1
-                print("  %-22s separated at %.3f s, kept the right side, packed to %d"
-                      % (stem[:22], cut, r["start"]))
-            except ProToolsError as e:
-                failed += 1
-                print("  %-22s FAILED: %s" % (stem[:22], e))
-    print("\n  %d track(s) trimmed%s." % (done, ", %d failed" % failed if failed else ""))
+                pt.edit_mode("EMode_Slip")
+            except Exception as e:
+                print("\n  WARNING: could not restore Slip mode: %s" % e)
+                print("  Pro Tools is still in SHUFFLE - set it back before editing.")
+
+    trim_summary(trimmed, skipped, failures)
+
+
+def trim_summary(trimmed, skipped, failures):
+    """
+    Say plainly what happened to every track.
+
+    Without this the outcome was a single count, and a track that dropped out
+    of the run looked identical to a track that was never there.
+    """
+    print()
+    print("  " + "=" * 58)
+    print("  HEAD TRIM: %d trimmed, %d skipped%s"
+          % (len(trimmed), len(skipped),
+             ", %d FAILED" % len(failures) if failures else ""))
+    print("  " + "=" * 58)
+
+    if trimmed:
+        print("\n  Trimmed:")
+        for stem, cut, start in trimmed:
+            print("    %-24s cut %.3f s  ->  starts at %d" % (stem[:24], cut, start))
+    if skipped:
+        print("\n  Skipped (nothing was changed on these):")
+        for stem, why in skipped:
+            print("    %-24s %s" % (stem[:24], why))
+    if failures:
+        print("\n  FAILED:")
+        for stem, why in failures:
+            print("    %-24s %s" % (stem[:24], why))
+    print()
 
 
 def cmd_align(args):

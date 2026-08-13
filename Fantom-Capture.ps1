@@ -583,12 +583,18 @@ function Start-Capture {
     $script:S.Message = "starting Pro Tools, then rolling..."
     Render
 
+    # Keep every line the child printed. The head trim reports at the very end
+    # of the pass, and this screen used to be cleared the moment the process
+    # exited -- so its output existed for a few milliseconds and was gone.
+    $log = New-Object System.Collections.ArrayList
+
     $tick = 0
     while ($true) {
         if ($proc.HasExited -and $q.Count -eq 0) { break }
 
         while ($q.Count -gt 0) {
             $ln = [string]$q.Dequeue()
+            [void]$log.Add($ln)
             Read-CaptureLine $ln
         }
 
@@ -605,7 +611,7 @@ function Start-Capture {
 
         if ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
-            ifif ($k.Key -eq "UpArrow")   { $script:S.Follow = $false; Move-Cursor -1 }
+            if ($k.Key -eq "UpArrow")   { $script:S.Follow = $false; Move-Cursor -1 }
             elseif ($k.Key -eq "DownArrow") { $script:S.Follow = $false; Move-Cursor  1 }
             elseif ($k.Key -eq "PageUp")    { $script:S.Follow = $false; Move-Cursor (-1 * (Get-VisibleRows)) }
             elseif ($k.Key -eq "PageDown")  { $script:S.Follow = $false; Move-Cursor (Get-VisibleRows) }
@@ -632,7 +638,35 @@ function Start-Capture {
     if ($sub) { Unregister-Event -SubscriptionId $sub.Id -ErrorAction SilentlyContinue }
     try { $proc.WaitForExit(2000) } catch { }
     $script:S.Phase = "done"; $script:S.PassPct = 100; $script:S.Rec = $false
+
+    Show-CaptureReport $log
     Clear-Screen
+}
+
+function Show-CaptureReport($log) {
+    <#
+        Show what the pass actually did, and wait.
+
+        The trim runs after the last take, so its report is the last thing the
+        child prints -- exactly the part that used to be wiped. Everything from
+        the trim banner onward is shown; failing that, the tail of the run.
+    #>
+    if (-not $log -or $log.Count -eq 0) { return }
+
+    $start = -1
+    for ($i = 0; $i -lt $log.Count; $i++) {
+        if ($log[$i] -match 'Trimming heads|HEAD TRIM') { $start = $i; break }
+    }
+    if ($start -lt 0) { $start = [Math]::Max(0, $log.Count - 12) }
+
+    Show-Cursor
+    Clear-Screen
+    Write-Host ""
+    foreach ($line in $log[$start..($log.Count - 1)]) { Write-Host $line }
+    Write-Host ""
+    Write-Host "  press a key..." -NoNewline
+    [void][Console]::ReadKey($true)
+    Hide-Cursor
 }
 
 # One line of the recorder's output, folded into the display state. Kept apart
