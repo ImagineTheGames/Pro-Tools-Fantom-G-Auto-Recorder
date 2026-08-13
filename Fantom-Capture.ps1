@@ -527,6 +527,7 @@ function Render-Ansi {
           (C 'lgreen') + "[A]" + (C 'lgray') + " trim  " +
           (C 'lgreen') + "[L]" + (C 'lgray') + " loops  " +
           (C 'lgreen') + "[F9]" + (C 'lgray') + " capture  " +
+          (C 'lred')   + "[S]"  + (C 'lgray') + " stop  " +
           (C 'lgreen') + "[F10]" + (C 'lgray') + " quit")
 }
 
@@ -855,7 +856,7 @@ try {
         Render
         $k = [Console]::ReadKey($true)
         switch ($k.Key) {
-            "F1" { $script:S.Message = "F2 song  F3 region  F5 test  F6 arm  F7 verify  A trim  F9 capture  L loops  C clock  " +
+            "F1" { $script:S.Message = "F2 song  F3 region  F5 test  F6 arm  F7 verify  A trim  F9 capture  S stop  L loops  C clock  " +
                                        [char]0x2191 + [char]0x2193 + "/PgUp/PgDn/Home/End scroll parts  F follow" }
             "F2" {
                 $f = Show-SongPicker
@@ -907,6 +908,24 @@ try {
                 Hide-Cursor; Clear-Screen
             }
             "F9"  { Start-Capture }
+            "S"   {
+                # Panic button. A crashed or abandoned capture leaves Pro Tools
+                # rolling and armed, the Fantom sounding, and orphaned
+                # processes. Quitting this console (F10/Q/Esc) does none of
+                # that, which is why this key exists separately.
+                Show-Cursor; Clear-Screen
+                $stop = Join-Path $script:Root "Stop-Capture.ps1"
+                if (Test-Path $stop) {
+                    & powershell -NoProfile -ExecutionPolicy Bypass -File $stop
+                } else {
+                    Write-Host "`n  Stop-Capture.ps1 not found beside this script."
+                }
+                Write-Host ""
+                Write-Host "  press a key..." -NoNewline
+                [void][Console]::ReadKey($true)
+                Hide-Cursor; Clear-Screen
+                Update-ProTools
+            }
             "F10" { return }
             "Q"   { return }
             "L"   { if ($script:S.Loops -ge 4) { $script:S.Loops = 1 } else { $script:S.Loops++ } }
