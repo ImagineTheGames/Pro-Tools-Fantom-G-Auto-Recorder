@@ -22,6 +22,7 @@
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import * as fs from 'fs';
+import * as readline from 'readline';
 
 const PROTO = process.env.PTSL_PROTO_PATH ||
   'C:\\ProTools\\PTSLSDK\\PTSL_SDK_CPP.2026.04.0.1301892\\Source\\PTSL.proto';
@@ -29,13 +30,18 @@ const ADDR = process.env.PTSL_ADDR || 'localhost:31416';
 
 const CMD = {
   GetTrackList: 3,
+  SelectAllClipsOnTrack: 4,
   SetPlaybackMode: 32,
   SetRecordMode: 33,
+  ExportSessionInfoAsText: 30,
   GetSessionSampleRate: 35,
   GetTransportState: 59,
   TogglePlayState: 64,
   ToggleRecordEnable: 65,
+  TrimToSelection: 6,
+  GetEditSelection: 12,
   GetMemoryLocations: 69,
+  ClearMemoryLocation: 61,
   RegisterConnection: 70,
   CreateMemoryLocation: 71,
   CreateNewTracks: 72,
@@ -44,6 +50,12 @@ const CMD = {
   SetTrackMuteState: 85,
   SetTrackSoloState: 86,
   SetTrackRecordEnableState: 88,
+  SetEditMode: 75,
+  Clear: 23,
+  Cut: 20,
+  Undo: 104,
+  Redo: 105,
+  Paste: 22,
   SetTrackInputMonitorState: 90,
   GetTransportArmed: 58,
 };
@@ -94,8 +106,285 @@ function arg(name, fallback = undefined) {
   return process.argv[i + 1];
 }
 
+/**
+ * Persistent mode: read one JSON command per line on stdin, write one JSON
+ * result per line on stdout.
+ *
+ * Spawning a fresh node process per command costs 150-300ms of startup, and
+ * that cost VARIES run to run. In a per-track capture that variance lands
+ * between "Pro Tools started recording" and "the MIDI started", so every take
+ * is offset by a different amount and the stems drift out of sync with each
+ * other. Holding the connection open removes it.
+ *
+ *   {"cmd":"record"}                        -> {"ok":true,"state":"..."}
+ *   {"cmd":"arm","name":"01 Bass"}
+ *   {"cmd":"locate","samples":0}
+ */
+async function serve() {
+  await connect();
+  await register();
+  process.stdout.write(JSON.stringify({ ok: true, ready: true, session: sessionId }) + "\n");
+
+  const rl = readline.createInterface({ input: process.stdin });
+  for await (const line of rl) {
+    const text = line.trim();
+    if (!text) continue;
+    let req;
+    try {
+      req = JSON.parse(text);
+    } catch (e) {
+      process.stdout.write(JSON.stringify({ ok: false, error: "bad json" }) + "\n");
+      continue;
+    }
+    try {
+      const out = await handle(req);
+      process.stdout.write(JSON.stringify(Object.assign({ ok: true }, out)) + "\n");
+    } catch (e) {
+      process.stdout.write(JSON.stringify({ ok: false, error: String(e.message || e) }) + "\n");
+    }
+    if (req.cmd === "quit") break;
+  }
+}
+
+const rolling = s => s && s.current_setting &&
+  s.current_setting !== "TState_TransportStopped";
+const live = s => s && (s.current_setting === "TState_TransportRecording" ||
+                        s.current_setting === "TState_TransportPlaying");
+
+async function waitFor(pred, tries = 100, ms = 10) {
+  let t = {};
+  for (let i = 0; i < tries; i++) {
+    t = await send(CMD.GetTransportState).catch(() => ({}));
+    if (pred(t)) return t;
+    await new Promise(r => setTimeout(r, ms));
+  }
+  return t;
+}
+
+/** One command, shared by serve() and the CLI. */
+async function handle(req) {
+  switch (req.cmd) {
+    case "ensure-track": {
+      const cur = await send(CMD.GetTrackList, { page_limit: 400 });
+      if ((cur.track_list || []).some(t => t.name === req.name)) return { created: false };
+      await send(CMD.CreateNewTracks, {
+        number_of_tracks: 1, track_name: req.name,
+        track_format: req.mono ? "TFormat_Mono" : "TFormat_Stereo",
+        track_type: "TType_Audio", track_timebase: "TTimebase_Samples",
+      });
+      return { created: true };
+    }
+    case "disarm-all": {
+      const cur = await send(CMD.GetTrackList, { page_limit: 400 });
+      const names = (cur.track_list || [])
+        .filter(t => t.type === "TT_Audio" || t.type === "TType_Audio")
+        .map(t => t.name);
+      if (names.length) {
+        await send(CMD.SetTrackRecordEnableState, { track_names: names, enabled: false });
+      }
+      return { disarmed: names.length };
+    }
+    case "arm":
+      await send(CMD.SetTrackRecordEnableState,
+                 { track_names: [req.name], enabled: req.off ? false : true });
+      return { track: req.name };
+    case "locate": {
+      const s = String(req.samples === undefined ? 0 : req.samples);
+      await send(CMD.SetTimelineSelection,
+                 { play_start_marker_time: s, in_time: s, out_time: s });
+      return { located: s };
+    }
+    case "record": {
+      let t = await send(CMD.GetTransportState).catch(() => ({}));
+      if (rolling(t)) { await send(CMD.TogglePlayState, {}); await waitFor(s => !rolling(s)); }
+      let armed = await send(CMD.GetTransportArmed).catch(() => ({}));
+      if (!armed.is_transport_armed) {
+        await send(CMD.ToggleRecordEnable, {});
+        armed = await send(CMD.GetTransportArmed).catch(() => ({}));
+      }
+      await send(CMD.TogglePlayState, {});
+      t = await waitFor(live);
+      return { state: t.current_setting || "unknown", armed: !!armed.is_transport_armed };
+    }
+    case "stop": {
+      let t = await send(CMD.GetTransportState).catch(() => ({}));
+      if (rolling(t)) { await send(CMD.TogglePlayState, {}); t = await waitFor(s => !rolling(s)); }
+      return { state: t.current_setting || "unknown" };
+    }
+    case "marker":
+      await send(CMD.CreateMemoryLocation, {
+        name: req.name || "Marker",
+        start_time: String(req.samples === undefined ? 0 : req.samples),
+        time_properties: "TP_Marker",
+        general_properties: { zoom_settings: false, pre_post_roll_times: false,
+          track_visibility: false, track_heights: false, group_enables: false },
+      });
+      return { marker: req.name };
+    case "markers": {
+      // Paginated: without a limit Pro Tools returns only the first page, and a
+      // partial list would make a delete look complete when it was not.
+      const out = [];
+      let offset = 0;
+      for (;;) {
+        const r = await send(CMD.GetMemoryLocations, {
+          pagination_request: { limit: 100, offset },
+        });
+        const page = r.memory_locations || [];
+        out.push(...page);
+        if (page.length < 100) break;
+        offset += page.length;
+        if (offset > 10000) break;
+      }
+      return { count: out.length, markers: out.map(m => ({
+        number: m.number, name: m.name, start: m.start_time,
+        type: m.time_properties, track: m.track_name || "" })) };
+    }
+    case "clear-markers": {
+      // Takes explicit numbers only. Deriving the list in here would mean this
+      // command decides what to delete; the caller should have seen them first.
+      const list = (req.numbers || []).map(Number).filter(n => Number.isFinite(n));
+      if (!list.length) throw new Error("clear-markers: no marker numbers given");
+      await send(CMD.ClearMemoryLocation, { location_list: list });
+      return { cleared: list.length, numbers: list };
+    }
+    // Separate at the selection and keep the right-hand side. PTSL has no
+    // Separate Clip command; Trim To Selection is Pro Tools' own verb for the
+    // same edit -- select from the cut point to the end, and everything before
+    // it goes. In Shuffle the survivor packs left to zero on its own.
+    case "separate-head": {
+      const cut = String(req.samples === undefined ? 0 : req.samples);
+      const end = String(req.end === undefined ? 0 : req.end);
+
+      await send(CMD.SelectTracksByName, { track_names: [req.name] });
+      await send(CMD.SelectAllClipsOnTrack, { track_name: req.name });
+      const st = await send(CMD.GetTrackList, { page_limit: 200 });
+      const holder = (st.track_list || []).find(
+        t => t.track_attributes?.has_edit_selection !== "None");
+      if (!holder || holder.name !== req.name)
+        throw new Error(`edit selection is on '${holder?.name}', refusing to edit '${req.name}'`);
+
+      await send(CMD.SetEditMode, { edit_mode: "EMode_Shuffle" });
+      await send(CMD.SetTimelineSelection, {
+        in_time: cut, out_time: end, play_start_marker_time: cut });
+      await send(CMD.TrimToSelection, {});
+      return { track: req.name, cut, end };
+    }
+    case "trim-head": {
+      // Clear the silence in front of a clip. Shuffle mode makes Clear ripple
+      // what follows to the left; in Slip it would leave a hole instead.
+      const cut = String(req.samples === undefined ? 0 : req.samples);
+
+      // Move the EDIT selection, not just the track selection. Cut/Clear/Paste
+      // follow has_edit_selection; SelectTracksByName only sets is_selected,
+      // so on its own the edit lands on whichever track held the cursor last.
+      await send(CMD.SelectTracksByName, { track_names: [req.name] });
+      await send(CMD.SelectAllClipsOnTrack, { track_name: req.name });
+
+      // Refuse to cut if the edit selection is not where we think it is.
+      const st = await send(CMD.GetTrackList, { page_limit: 400 });
+      const holder = (st.track_list || []).find(
+        t => t.track_attributes && t.track_attributes.has_edit_selection &&
+             t.track_attributes.has_edit_selection !== "None");
+      if (!holder || holder.name !== req.name) {
+        throw new Error(`edit selection is on '${holder ? holder.name : "nothing"}', ` +
+                        `refusing to cut '${req.name}'`);
+      }
+
+      await send(CMD.SetEditMode, { edit_mode: "EMode_Shuffle" });
+      await send(CMD.SetTimelineSelection,
+                 { play_start_marker_time: "0", in_time: "0", out_time: cut });
+      await send(CMD.Clear, {});
+      return { track: req.name, removed_samples: cut, verified_on: holder.name };
+    }
+    case "undo":
+      await send(CMD.Undo, {});
+      return { undone: true };
+    case "redo":
+      await send(CMD.Redo, {});
+      return { redone: true };
+    case "edit-mode":
+      await send(CMD.SetEditMode, { edit_mode: req.mode || "EMode_Slip" });
+      return { edit_mode: req.mode || "EMode_Slip" };
+    case "tempo":
+      // PTSL has no tempo setter; report what the session says it is.
+      return { note: "PTSL cannot set session tempo; set it by hand" };
+    case "edl": {
+      // Ground truth for where clips actually sit. ExportSessionInfoAsText with
+      // track EDLs returnsÃ¦Â¯Â clip's start/end per track, which is the only way
+      // to confirm an edit landed -- PTSL will happily return ok for a command
+      // that acted on the wrong track, and the WAV on disk never changes.
+      const r = await send(CMD.ExportSessionInfoAsText, {
+        include_file_list: false,
+        include_clip_list: false,
+        include_markers: false,
+        include_plugin_list: false,
+        include_track_edls: true,
+        show_sub_frames: false,
+        include_user_timestamps: false,
+        track_list_type: "TListType_AllTracks",
+        fade_handling_type: "FHType_DontShowCrossfades",
+        text_as_file_format: "TFFormat_UTF8",
+        output_type: "ESI_String",
+        location_type: "TLType_Samples",
+      });
+      return { text: r.session_info || "" };
+    }
+    case "select-clips": {
+      // Move the EDIT selection, which is what Cut/Clear/Paste actually follow.
+      // Selecting the track alone only sets is_selected; has_edit_selection
+      // stays wherever it was, and edits land on the wrong track.
+      await send(CMD.SelectTracksByName, { track_names: [req.name] });
+      await send(CMD.SelectAllClipsOnTrack, { track_name: req.name });
+      return { track: req.name };
+    }
+    case "tracks-state": {
+      const cur = await send(CMD.GetTrackList, { page_limit: 400 });
+      return { tracks: (cur.track_list || []).map(t => ({
+        name: t.name,
+        selected: t.track_attributes && t.track_attributes.is_selected,
+        edit: t.track_attributes && t.track_attributes.has_edit_selection,
+      })) };
+    }
+    case "shift-left": {
+      // Move a clip's material left by `samples`, by cutting from the transient
+      // to the end and pasting at zero. Unlike Clear-in-Shuffle this doesn't
+      // depend on the edit mode rippling the way we expect -- the paste lands
+      // wherever we put the insertion point, which we set explicitly.
+      const cut = String(req.samples === undefined ? 0 : req.samples);
+      const end = String(req.end === undefined ? 0 : req.end);
+      await send(CMD.SelectTracksByName, { track_names: [req.name] });
+      await send(CMD.SetEditMode, { edit_mode: "EMode_Slip" });
+      await send(CMD.SetTimelineSelection, { in_time: cut, out_time: end,
+                                             play_start_marker_time: cut });
+      await send(CMD.Cut, {});
+      await send(CMD.SetTimelineSelection, { in_time: "0", out_time: "0",
+                                             play_start_marker_time: "0" });
+      await send(CMD.Paste, {});
+      return { track: req.name, moved_by: cut };
+    }
+    case "clip-extent": {
+      // Where does this track's material actually sit? Selecting every clip on
+      // the track and reading the resulting timeline selection gives its true
+      // start and end -- which is how you verify a trim, since trimming changes
+      // the clip and never touches the WAV on disk.
+      await send(CMD.SelectTracksByName, { track_names: [req.name] });
+      await send(CMD.SelectAllClipsOnTrack, { track_name: req.name });
+      const sel = await send(CMD.GetTimelineSelection,
+                             { time_scale: "TScale_Samples" }).catch(() => ({}));
+      return { track: req.name, in: sel.in_time, out: sel.out_time };
+    }
+    case "transport":
+      return await send(CMD.GetTransportState);
+    case "quit":
+      return { bye: true };
+    default:
+      throw new Error("unknown cmd: " + req.cmd);
+  }
+}
+
 async function main() {
   const cmd = process.argv[2];
+  if (cmd === "serve") { await serve(); return; }
   if (!cmd) {
     console.error('Usage: node ptools.js <info|tracks|create-track|select|record-arm|play|stop|transport|marker|markers-from-cues>');
     process.exit(1);
@@ -273,12 +562,17 @@ async function main() {
       break;
     }
     case 'markers': {
-      const r = await send(CMD.GetMemoryLocations, { page_limit: 200 });
-      const list = r.memory_locations || [];
-      console.log(`${list.length} memory location(s):`);
-      for (const m of list) {
-        console.log(`  #${String(m.number || '').padEnd(4)} ${(m.name || '').padEnd(24)} ${m.start_time || ''}`);
+      const r = await handle({ cmd: 'markers' });
+      console.log(`${r.count} memory location(s):`);
+      for (const m of r.markers) {
+        console.log(`  #${String(m.number).padEnd(4)} ${(m.name || '').padEnd(24)} ${m.start}`);
       }
+      break;
+    }
+    case 'clear-markers': {
+      const nums = (arg('numbers') || '').split(',').map(s => s.trim()).filter(Boolean);
+      const r = await handle({ cmd: 'clear-markers', numbers: nums });
+      console.log(JSON.stringify(r, null, 2));
       break;
     }
     case 'transport': {
@@ -338,3 +632,4 @@ async function main() {
 }
 
 main().catch(e => { console.error(String(e.message || e)); process.exit(1); });
+

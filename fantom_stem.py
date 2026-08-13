@@ -23,6 +23,8 @@ Split the recording at the bar positions in the generated cue sheet.
 import argparse
 import csv
 import ctypes
+import glob
+import json
 import os
 import re
 import sys
@@ -482,18 +484,15 @@ def cmd_test(args):
     print("Done. If you heard nothing, check the synth's part/channel assignment.")
 
 
-#: PTSL client. Sits beside this file by default; override with PTOOLS_JS.
-PTOOLS_JS = os.environ.get(
-    "PTOOLS_JS",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "ptools.js"))
+PTOOLS_JS = r"C:\Users\Rei\protools-mcp-server\ptools.js"
 
 
 def ptools(*args):
     """
-    Drive Pro Tools over PTSL. Returns (ok, output).
+    Drive Pro Tools over PTSL, one-shot. Returns (ok, output).
 
-    Failures are reported but never abort a capture -- losing the DAW
-    automation is annoying, losing a pass mid-flight is worse.
+    Convenient but SLOW and, worse, inconsistently slow: each call spawns a
+    node process. Use PTools() for anything inside a capture loop.
     """
     import subprocess
     try:
@@ -503,6 +502,67 @@ def ptools(*args):
         return r.returncode == 0, out
     except Exception as e:
         return False, str(e)
+
+
+class PTools(object):
+    """
+    A persistent PTSL connection.
+
+    Node takes 150-300ms to start and that cost varies run to run. Spawning it
+    per command puts that variance between "Pro Tools is recording" and "the
+    MIDI starts" -- so every take lands at a slightly different offset and the
+    stems drift out of sync with each other. Keeping one process alive for the
+    whole pass removes it: commands then cost about a millisecond.
+    """
+
+    def __init__(self, js=None):
+        import subprocess
+        self.proc = subprocess.Popen(
+            ["node", js or PTOOLS_JS, "serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        hello = self._read()
+        self.ready = bool(hello and hello.get("ok"))
+
+    def _read(self):
+        line = self.proc.stdout.readline()
+        if not line:
+            return None
+        try:
+            return json.loads(line)
+        except ValueError:
+            return None
+
+    def __call__(self, cmd, **kw):
+        if self.proc.poll() is not None:
+            return {"ok": False, "error": "ptools exited"}
+        kw["cmd"] = cmd
+        try:
+            self.proc.stdin.write(json.dumps(kw) + "\n")
+            self.proc.stdin.flush()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+        return self._read() or {"ok": False, "error": "no reply"}
+
+    def close(self):
+        try:
+            self(("quit"))
+        except Exception:
+            pass
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=3)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def fmt_timecode(seconds, fps=30):
@@ -679,6 +739,396 @@ def clock_events(song, total, start_stop=False, bpm=None):
     return events
 
 
+def cmd_markers(args):
+    """List the session's memory locations, and optionally remove them."""
+    from protools import Session, ProToolsError
+    with Session() as pt:
+        marks = pt.markers()
+        if not marks:
+            print("  No memory locations in the session.")
+            return
+
+        print()
+        print("  %-6s %-26s %14s  %s" % ("NUM", "NAME", "START", "TYPE"))
+        print("  " + "-" * 6 + " " + "-" * 26 + " " + "-" * 14 + "  " + "-" * 12)
+        for m in marks:
+            print("  #%-5s %-26s %14s  %s" % (
+                m["number"], m["name"][:26], m["start"],
+                (m.get("type") or "").replace("TP_", "")))
+        print("\n  %d memory location(s)." % len(marks))
+
+        if not args.clear:
+            print("  Add --clear to remove them.")
+            return
+
+        # Only the ones this tool made, unless told otherwise. Everything it
+        # writes is named after the part it marks.
+        if args.all:
+            doomed = marks
+        else:
+            doomed = [m for m in marks if re.match(r"^\s*Track \d+\s*$", m["name"] or "")]
+            skipped = len(marks) - len(doomed)
+            if skipped:
+                print("  Keeping %d marker(s) this tool did not create; "
+                      "use --all to remove those too." % skipped)
+        if not doomed:
+            print("  Nothing to remove.")
+            return
+
+        if not args.yes:
+            print("\n  About to delete %d marker(s). Re-run with --yes to do it."
+                  % len(doomed))
+            return
+
+        try:
+            r = pt.clear_markers([m["number"] for m in doomed])
+        except ProToolsError as e:
+            sys.exit("  %s" % e)
+        print("\n  Removed %d marker(s); %d left in the session."
+              % (r["cleared"], r["remaining"]))
+
+
+def cmd_verify(args):
+    """Measure every recorded stem, since you can't listen to an unattended pass."""
+    from audio import latest_takes
+    takes = latest_takes(args.session)
+    if not takes:
+        sys.exit("No .L.wav files under %s" % args.session)
+
+    print()
+    print("  %-22s %8s %8s %7s %7s  %-8s %s" % (
+        "TRACK", "PEAK", "RMS", "CREST", "ONSET", "CHAR", "ISSUE"))
+    print("  " + "-" * 22 + " " + "-" * 8 + " " + "-" * 8 + " " + "-" * 7 + " " +
+          "-" * 7 + "  " + "-" * 8 + " " + "-" * 24)
+    bad = 0
+    for name in sorted(takes):
+        t = takes[name]
+        clipped, runs, _ = t.clipping
+        issue = ""
+        if not t.has_audio:
+            issue = "SILENT"
+        elif runs and clipped:
+            issue = "CLIPPING (%d flat runs)" % runs
+        elif t.character == "static":
+            issue = "static - hum or drone?"
+        elif t.peak_db > -1.0:
+            issue = "very hot"
+        if issue:
+            bad += 1
+        print("  %-22s %8.1f %8.1f %7.1f %7s  %-8s %s" % (
+            name[:22], t.peak_db, t.rms_db, t.crest_db,
+            "-" if t.onset is None else "%.3f" % t.onset, t.character, issue))
+    print()
+    print("  %d take(s), %d needing attention." % (len(takes), bad))
+    if args.detail:
+        for name in sorted(takes):
+            print()
+            print("  " + name)
+            print(takes[name].report())
+    print()
+
+
+def cmd_tab(args):
+    """
+    Tab to transient, split, delete left, shift left -- on every track.
+
+    Pro Tools exposes none of those four operations to scripting: there is no
+    Tab to Transient, no Separate Clip, no nudge. The result is reachable
+    another way. Find the attack in the recorded file, then delete that much
+    from the front of the clip with the session in Shuffle mode, where a
+    deletion ripples everything after it to the left. Splitting, deleting the
+    left half and dragging the right half to zero is one operation once you
+    are in Shuffle, and this is that operation.
+    """
+    from audio import Take
+    from protools import Session, ProToolsError
+
+    # --grid keeps parts that do not begin on beat 1 where they belong. Without
+    # it, a part whose first note is a beat into the loop gets that beat pulled
+    # to zero, and it plays a beat early against everything else.
+    midi_start = {}
+    if args.grid:
+        song = Song(args.grid)
+        for i, key in enumerate(song.parts.keys(), start=1):
+            ev = song.parts[key]["events"]
+            first = next((t for t, m in ev if m.type == "note_on" and m.velocity > 0), None)
+            if first is not None:
+                midi_start[i] = song.tick_to_sec(first)
+
+    files = glob.glob(os.path.join(args.session, "**", "*.L.wav"), recursive=True)
+    newest = {}
+    for p in files:
+        stem = os.path.basename(p).split("_")[0]
+        if stem.upper().startswith("ZZ"):
+            continue
+        if stem not in newest or os.path.getmtime(p) > os.path.getmtime(newest[stem]):
+            newest[stem] = p
+    if not newest:
+        sys.exit("No .L.wav files under %s" % args.session)
+
+    def order(stem):
+        m = re.match(r"^(\d+)", stem)
+        return (int(m.group(1)) if m else 999, stem)
+
+    print()
+    print("  %-22s %10s %10s %10s  %s" % (
+        "TRACK", "TRANSIENT", "GRID", "CUT", "NOTE"))
+    print("  " + "-" * 22 + " " + "-" * 10 + " " + "-" * 10 + " " + "-" * 10 + "  " + "-" * 22)
+
+    # How much has already come off each clip. Trimming shortens the clip but
+    # never touches the file, so file length minus clip length is exactly what
+    # a previous run removed -- and the command stays safe to re-run.
+    with Session() as pt:
+        clip_len = {}
+        for name, cl in pt.clips().items():
+            if cl:
+                clip_len[name] = max(c[2] for c in cl) - min(c[1] for c in cl)
+
+    plan = []
+    found = []
+    for stem in sorted(newest, key=order):
+        t = Take(newest[stem])
+        # Default to the FOOT of the attack -- the last moment still down in
+        # the noise. Snapping forward to the note's playing level matched one
+        # track and ate the front of the other nineteen: measured against each
+        # track's own level, all twenty had note material in the 40 ms before
+        # the cut. Leaving a few milliseconds of silence is inaudible; removing
+        # the leading edge of every note is not.
+        tr = t.tab_to_transient() if args.snap else t.transient(guard_ms=args.guard)
+        m = re.match(r"^(\d+)", stem)
+        idx = int(m.group(1)) if m else None
+        offset = midi_start.get(idx, 0.0) if args.grid else 0.0
+        if tr is None:
+            plan.append((stem, t, None, offset, "no attack found - skipped"))
+            continue
+        found.append(tr - offset)
+        plan.append((stem, t, tr, offset, ""))
+
+    if not found:
+        sys.exit("\n  No transient could be measured on any track.")
+
+    # The group median is the sanity check: every take came off the same rig,
+    # so a track that wants to cut far more than its neighbours is a detection
+    # failure, not a track that happens to start late.
+    med = sorted(found)[len(found) // 2]
+
+    todo = []
+    for stem, t, tr, offset, note in plan:
+        # Filtering happens here, not during the scan: the group median is only
+        # meaningful if it was taken across the whole session.
+        if args.tracks and stem not in args.tracks:
+            continue
+        # A take whose track is gone from the session is just a file left on
+        # disk. Editing it is impossible and listing it is noise.
+        if stem not in clip_len:
+            continue
+        gone = len(t.samples) - clip_len[stem]
+        if tr is None:
+            # --fill: every take came off the same rig at the same latency, so
+            # the group's own median is a better answer for a track whose
+            # attack cannot be seen than leaving it a third of a second late.
+            if args.fill:
+                samples = int(round(med * t.rate)) - gone
+                if samples > 2:
+                    todo.append((stem, samples, samples / float(t.rate)))
+                    print("  %-22s %10s %9.3fs %9.3fs  no attack - group median"
+                          % (stem[:22], "-", offset, samples / float(t.rate)))
+                else:
+                    print("  %-22s %10s %9.3fs %10s  no attack - already trimmed"
+                          % (stem[:22], "-", offset, "-"))
+            else:
+                print("  %-22s %10s %10s %10s  %s" % (stem[:22], "-", "-", "-", note))
+            continue
+        cut = max(0.0, tr - offset)
+        off = cut - med
+        # The group check only means something under --grid, where every track
+        # is expected to cut by the same rig latency. Plain tab to transient
+        # cuts each track to ITS OWN attack, so a part that starts a beat into
+        # the loop is supposed to cut a beat more than its neighbours -- and
+        # measuring that against the group threw those tracks out.
+        if args.grid and abs(off) > args.tolerance:
+            note = "%+.0f ms vs group - skipped" % (1000.0 * off)
+            print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
+            continue
+        samples = int(round(cut * t.rate)) - gone
+        if samples <= 2:
+            if gone > 2:
+                note = "already trimmed %.3fs" % (gone / float(t.rate))
+                if samples < -2:
+                    note += " - %.0f ms PAST this point" % (-1000.0 * samples / t.rate)
+            else:
+                note = "already at zero"
+            print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
+            continue
+        todo.append((stem, samples, samples / float(t.rate)))
+        extra = "" if gone <= 2 else "  (%.3fs already off)" % (gone / float(t.rate))
+        print("  %-22s %9.3fs %9.3fs %9.3fs  %+.0f ms vs group%s"
+              % (stem[:22], tr, offset, samples / float(t.rate), 1000.0 * off, extra))
+
+    print("\n  group median cut %.3f s   %d track(s) to trim" % (med, len(todo)))
+
+    if args.grid:
+        late = [i for i, v in midi_start.items() if v > 0.05]
+        if late:
+            print("  --grid is on: %d part(s) whose first note is not on beat 1 keep "
+                  "their offset." % len(late))
+
+    if not todo:
+        return
+    if args.dry_run:
+        print("\n  Dry run. Re-run without --dry-run to apply.")
+        return
+    if not args.yes:
+        print("\n  Add --yes to apply.")
+        return
+
+    print()
+    done = failed = 0
+    with Session() as pt:
+        for stem, samples, cut in todo:
+            try:
+                r = pt.separate_head(stem, samples)
+                done += 1
+                print("  %-22s separated at %.3f s, kept the right side, packed to %d"
+                      % (stem[:22], cut, r["start"]))
+            except ProToolsError as e:
+                failed += 1
+                print("  %-22s FAILED: %s" % (stem[:22], e))
+    print("\n  %d track(s) trimmed%s." % (done, ", %d failed" % failed if failed else ""))
+
+
+def cmd_align(args):
+    """Trim the capture lead off every stem so bar 1 lands on bar 1."""
+    from audio import latest_takes
+    from protools import Session, ProToolsError
+
+    song = Song(args.file)
+    order = list(song.parts.keys())
+    midi_start = {}
+    for i, key in enumerate(order, start=1):
+        ev = song.parts[key]["events"]
+        first = next((t for t, m in ev if m.type == "note_on" and m.velocity > 0), None)
+        if first is not None:
+            midi_start[i] = song.tick_to_sec(first)
+
+    takes = latest_takes(args.session)
+    print()
+    print("  %-22s %9s %9s %9s" % ("TRACK", "AUDIO", "MIDI", "LEAD"))
+    print("  " + "-" * 22 + " " + "-" * 9 + " " + "-" * 9 + " " + "-" * 9)
+
+    leads = {}
+    rate = 48000
+    for name in sorted(takes, key=lambda s: (re.match(r"^(\d+)", s) or [0, "999"])[1]):
+        m = re.match(r"^(\d+)", name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        t = takes[name]
+        rate = t.rate
+        if t.onset is None or idx not in midi_start:
+            print("  %-22s %9s %9s %9s" % (name[:22], "-", "-", "skip"))
+            continue
+        lead = t.onset - midi_start[idx]
+        leads[name] = lead
+        print("  %-22s %8.3fs %8.3fs %8.3fs" % (name[:22], t.onset, midi_start[idx], lead))
+
+    if not leads:
+        sys.exit("\n  Could not measure a lead on any track.")
+
+    # The dominant cluster, not the mean: a session usually holds takes from
+    # several runs, and an average of two clusters belongs to neither.
+    values = sorted(leads.values())
+    best_i, best_n = 0, 0
+    for i in range(len(values)):
+        j = i
+        while j < len(values) and values[j] - values[i] <= 0.15:
+            j += 1
+        if j - i > best_n:
+            best_n, best_i = j - i, i
+    cluster = values[best_i:best_i + best_n]
+    lo, hi = min(cluster), max(cluster)
+
+    # Trim by the SMALLEST lead in the cluster, never the median or mean.
+    # The earliest-starting track defines where audio actually begins; cutting
+    # by anything larger removes real material from every track below that
+    # figure. `keep` then backs off a little further as insurance.
+    lead = max(0.0, lo - args.keep)
+
+    print()
+    print("  cluster : %d of %d track(s) agree, %.3f-%.3f s" % (len(cluster), len(leads), lo, hi))
+    print("  earliest: %.3f s  <- the trim is bounded by this" % lo)
+    print("  trimming: %.3f s  (%.0f ms of headroom kept)" % (lead, args.keep * 1000))
+    if hi - lo > 0.020:
+        print("  note    : leads differ by %.0f ms, so tracks above the earliest keep"
+              % ((hi - lo) * 1000))
+        print("            that much silence. Better that than cutting audio.")
+    outside = [n for n, l in leads.items() if not (lo <= l <= hi)]
+    if outside:
+        print("  leaving alone (different run): %s" % ", ".join(sorted(outside)[:6]))
+    print()
+
+    if args.dry_run:
+        print("  Dry run - nothing changed.")
+        print("  Session tempo should be %.2f BPM (set by hand; PTSL has no setter)."
+              % song.tempo_bpm())
+        return
+    if lead <= 0.001:
+        print("  Nothing to remove.")
+        return
+
+    samples = int(round(lead * rate))
+    done = failed = 0
+    with Session() as pt:
+        for name in sorted(leads):
+            if not (lo <= leads[name] <= hi):
+                continue
+            try:
+                r = pt.trim_head(name, samples)
+                print("  %-22s -%.3fs  verified" % (name[:22], r["removed"] / float(rate)))
+                done += 1
+            except ProToolsError as e:
+                print("  %-22s FAILED: %s" % (name[:22], e))
+                failed += 1
+        pt.edit_mode("EMode_Slip")
+
+    print()
+    print("  %d track(s) aligned%s." % (done, ", %d failed" % failed if failed else ""))
+    print("  Session tempo should be %.2f BPM (set by hand; PTSL has no setter)."
+          % song.tempo_bpm())
+
+
+def cmd_panic(args):
+    """Silence the synth: MIDI Stop, all-sound-off, note-offs on every channel."""
+    port, desc = open_output(args)
+    with port:
+        port.send(mido.Message("stop"))
+        panic_all(port)
+        for ch in range(16):
+            for note in range(128):
+                port.send(mido.Message("note_off", channel=ch, note=note, velocity=0))
+    print("  Silenced %s" % desc)
+
+
+def cmd_session(args):
+    """What is actually on the Pro Tools timeline."""
+    from protools import Session
+    with Session() as pt:
+        clips = pt.clips()
+        edit = pt.edit_selection()
+        print()
+        print("  %-22s %-28s %12s %12s" % ("TRACK", "CLIP", "START", "END"))
+        print("  " + "-" * 22 + " " + "-" * 28 + " " + "-" * 12 + " " + "-" * 12)
+        for name in sorted(clips):
+            if not clips[name]:
+                print("  %-22s %-28s" % (name[:22], "(empty)"))
+                continue
+            for c in clips[name]:
+                print("  %-22s %-28s %12d %12d" % (name[:22], c[0][:28], c[1], c[2]))
+        print()
+        print("  edit selection: %s" % (edit or "none"))
+        print()
+
+
 def cmd_inspect(args):
     song = Song(args.file)
     print()
@@ -778,8 +1228,21 @@ def run_per_track(song, keys, args):
     print("  Port: %s" % desc)
     print("  Mode: one Pro Tools track per part\n")
 
+    # Number tracks by their position in the SONG, not in the selection, so
+    # "--parts 12" re-records onto "12 Track 12" rather than creating a new
+    # "01 Track 12" beside it.
+    song_order = dict((k, i) for i, k in enumerate(song.parts.keys(), start=1))
+
     enable_hires_timer()
     made = 0
+    # One persistent PTSL connection for the whole pass. Spawning node per
+    # command cost 150-300ms of *variable* startup, which landed between
+    # "recording started" and "MIDI started" and left every take at a slightly
+    # different offset -- the stems drifted out of sync with each other.
+    pt = PTools()
+    if not pt.ready:
+        print("  WARNING: could not open a persistent Pro Tools connection;")
+        print("           falling back to per-command mode (takes may drift).")
     try:
         with port:
             panic_all(port)
@@ -800,14 +1263,22 @@ def run_per_track(song, keys, args):
                 name = re.sub(r"[^A-Za-z0-9 _-]", "", part["name"]).strip()[:24]
                 track = "%02d %s" % (idx, name or ("Part %d" % idx))
 
-                ptools("ensure-track", "--name", track)
-                ptools("disarm-all")
-                ptools("record-arm", "--name", track)
-                ptools("locate", "--samples", "0")
-                # 'record' already waits for the transport to be genuinely
-                # rolling, so the pre-roll here only needs to cover converter
+                # Announce the part before rolling, not after. A part takes the
+                # better part of a minute and printed nothing until it was over,
+                # which left anything watching this output with no way to show
+                # what was happening -- or which file to meter.
+                print("  >> %2d/%d  %-22s ch%-3d recording -> %s"
+                      % (idx, len(keys), part["name"], part["channel"] + 1, track),
+                      flush=True)
+
+                pt("ensure-track", name=track)
+                pt("disarm-all")
+                pt("arm", name=track)
+                pt("locate", samples=0)
+                # 'record' returns only once the transport is genuinely
+                # recording, so the pre-roll here only needs to cover converter
                 # latency -- not several seconds of dead air at the top.
-                ptools("record")
+                pt("record")
                 time.sleep(args.pt_preroll)
 
                 # Whatever happens to the MIDI, Pro Tools must be stopped. A
@@ -830,7 +1301,7 @@ def run_per_track(song, keys, args):
                 except Exception as e:
                     failed = e
                 finally:
-                    ptools("stop")
+                    pt("stop")
                     for m in panic_messages(part["channel"]):
                         port.send(m)
 
@@ -842,14 +1313,15 @@ def run_per_track(song, keys, args):
                 made += 1
                 print("  %2d/%d  %-22s ch%-3d %s  -> %s"
                       % (idx, len(keys), part["name"], part["channel"] + 1,
-                         fmt_time(total), track))
+                         fmt_time(total), track), flush=True)
                 time.sleep(0.35)
     except KeyboardInterrupt:
         print("\n  Interrupted.")
-        ptools("stop")
+        pt("stop")
     finally:
         release_hires_timer()
-        ptools("disarm-all")
+        pt("disarm-all")
+        pt.close()
 
     print("\n  Done. %d track(s) recorded, each starting at timeline zero." % made)
 
@@ -858,6 +1330,13 @@ def cmd_run(args):
     song = Song(args.file)
     keys = select_parts(song, args.parts)
     if args.per_track:
+        # Per-track takes each start at timeline zero, so a lead bar and a long
+        # pre-roll are pure silence at the head of every stem. Unless the user
+        # asked for them explicitly, drop them.
+        if "--lead" not in sys.argv:
+            args.lead = 0
+        if "--pt-preroll" not in sys.argv:
+            args.pt_preroll = 0.3
         return run_per_track(song, keys, args)
 
     events, cues, total, loop_bars, skipped = build_schedule(
@@ -1005,6 +1484,55 @@ def main():
                     help="tempo for the clock sent by --hold (default 120)")
     tr.set_defaults(func=cmd_transport)
 
+    mk = sub.add_parser("markers", help="list or remove session memory locations")
+    mk.add_argument("--clear", action="store_true", help="remove them")
+    mk.add_argument("--all", action="store_true",
+                    help="include markers this tool did not create")
+    mk.add_argument("--yes", action="store_true", help="skip the confirmation")
+    mk.set_defaults(func=cmd_markers)
+
+    v = sub.add_parser("verify", help="measure the recorded stems")
+    v.add_argument("session", nargs="?", default=os.environ.get("PT_SESSION", "."))
+    v.add_argument("--detail", action="store_true", help="full report per take")
+    v.set_defaults(func=cmd_verify)
+
+    tb = sub.add_parser("tab", help="tab to transient, split, delete left, shift left")
+    tb.add_argument("session", help="Pro Tools session folder")
+    tb.add_argument("--grid", metavar="SONG.mid",
+                    help="keep parts whose first note is not on beat 1 in place")
+    tb.add_argument("--guard", type=float, default=0.0,
+                    help="milliseconds to leave in front of the attack (default 0)")
+    tb.add_argument("--snap", action="store_true",
+                    help="cut at the note's playing level rather than the foot of "
+                         "its attack; tighter, but it removes the leading edge")
+    tb.add_argument("--tolerance", type=float, default=0.15,
+                    help="skip tracks whose cut differs from the group median by "
+                         "more than this many seconds (default 0.15)")
+    tb.add_argument("--fill", action="store_true",
+                    help="for tracks with no detectable attack, cut the group median")
+    tb.add_argument("--tracks", metavar="NAME", nargs="+",
+                    help="only these track names")
+    tb.add_argument("--dry-run", action="store_true", help="show the plan only")
+    tb.add_argument("--yes", action="store_true", help="apply the trims")
+    tb.set_defaults(func=cmd_tab)
+
+    al = sub.add_parser("align", help="trim the capture lead so bar 1 is bar 1")
+    al.add_argument("file", help="the SMF that was captured")
+    al.add_argument("session", nargs="?", default=os.environ.get("PT_SESSION", "."))
+    al.add_argument("--dry-run", action="store_true", help="measure, change nothing")
+    al.add_argument("--keep", type=float, default=0.020,
+                    help="seconds of headroom left before the earliest onset "
+                         "(default 0.020 - insurance against cutting audio)")
+    al.set_defaults(func=cmd_align)
+
+    se = sub.add_parser("session", help="show what is on the Pro Tools timeline")
+    se.set_defaults(func=cmd_session)
+
+    pa = sub.add_parser("panic", help="silence the synth immediately")
+    pa.add_argument("--port")
+    pa.add_argument("--usb", action="store_true")
+    pa.set_defaults(func=cmd_panic)
+
     i = sub.add_parser("inspect", help="analyse an SMF")
     i.add_argument("file")
     i.set_defaults(func=cmd_inspect)
@@ -1073,3 +1601,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

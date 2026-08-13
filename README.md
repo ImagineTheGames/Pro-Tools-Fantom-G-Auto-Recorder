@@ -1,230 +1,146 @@
-# Pro Tools Fantom G Auto Recorder
+# fantom-stem
 
-Records every part of a Roland Fantom-G song into Pro Tools as an isolated
-audio stem, unattended — replacing the manual "mute everything but one track,
-hit record, repeat twenty times" routine.
-
-It plays **one part at a time** to the synth over MIDI and drives Pro Tools'
-transport in step, so a twenty-part song becomes twenty named, aligned tracks
-without anyone in the room.
-
-Two things make it work on hardware that Windows officially abandoned:
-
-- **Raw USB MIDI.** Roland's last Fantom-G driver was for Windows 8.1. This
-  bypasses it entirely, talking to the synth's bulk endpoint through WinUSB.
-  No vendor driver, no Secure Boot changes, no unsigned kernel drivers.
-- **PTSL.** Pro Tools' scripting API creates the tracks, arms them, rolls
-  record and stops — synchronised with MIDI playback rather than guessed at.
-
-Measured timing on the reference rig: **0.018 ms mean scheduling latency**,
-0.8 ms worst case. Tighter than the MIDI wire itself.
-
----
+Per-part stem capture for hardware synths. Replaces the manual
+"mute everything but one track, record, repeat" workflow.
 
 ## How it works
 
-```
-  Standard MIDI File
-          │
-          │  one part's notes at a time
-          ▼
-   [ this tool ] ──raw USB bulk──►  Fantom-G sound engine
-          │                                  │
-          │  PTSL over gRPC                  │  analogue outs
-          ▼                                  ▼
-     Pro Tools  ◄───────────────────  audio interface
-```
+The synth's own sequencer is not used. Instead the song is exported as a
+Standard MIDI File, and this tool plays **one part at a time** out to the synth
+over MIDI. The synth still generates all the audio through its own engine,
+patches and effects — the only thing that changes is where the note data comes
+from and how isolation is achieved. Nothing is muted; the other parts' notes
+are simply not sent.
 
-The synth's own sequencer is never used. Isolation happens by simply **not
-sending** the other parts' notes — nothing is muted, and your Live Set stays
-exactly as you left it. No program changes are sent either, so whatever
-patches you have loaded are what gets recorded.
-
----
-
-## Requirements
-
-| | |
-|---|---|
-| Synth | Roland Fantom-G6 / G7 / G8 |
-| DAW | Pro Tools 2024.10 or later (PTSL) |
-| OS | Windows 10 / 11 |
-| Python | 3.10+ with `mido`, `python-rtmidi`, `pyusb`, `libusb-package` |
-| Node | 18+ (for the PTSL client) |
-| SDK | Avid PTSL SDK — **you must obtain this yourself**, see below |
-| Driver | WinUSB bound to the Fantom via [Zadig](https://zadig.akeo.ie) |
-
-Audio is recorded through whatever interface your synth's outputs are cabled
-to. The tool never touches audio routing — only MIDI and the transport.
-
----
+Because each part is short, the whole capture fits in **one continuous DAW
+record pass**. Arm one stereo track, hit record once, run the tool, stop. Then
+split the resulting file at the bar positions in the generated cue sheet.
 
 ## Setup
 
-**1. Python dependencies**
+Python and the two libraries are already installed at:
 
-```
-pip install mido python-rtmidi pyusb libusb-package numpy
-```
+    C:\Users\Rei\AppData\Local\Programs\Python\Python312\python.exe
 
-`numpy` is only needed for the spectral analysis in `tools/`.
+If you ever need to reinstall the libraries:
 
-**2. Bind WinUSB to the Fantom**
+    python -m pip install mido python-rtmidi
 
-The Fantom-G presents a vendor-specific USB interface (class `FF`), so Windows
-won't attach a driver to it. Use [Zadig](https://zadig.akeo.ie):
+## Two ways to reach the synth
 
-- Options → **List All Devices**
-- Select **Fantom G** — confirm the USB ID reads `0582 00DE`
-- Choose **WinUSB** and click Replace Driver
+**A normal MIDI port** (`--port "name"`) — via a USB MIDI interface into the
+Fantom's 5-pin DIN jacks, or any other OS-visible MIDI output.
 
-> Check that USB ID carefully. Replacing the driver on the wrong device will
-> break it. Reversible from Device Manager → Uninstall device.
+**Raw USB** (`--usb`) — talks to the Fantom directly over libusb, bypassing
+Windows' MIDI stack entirely. This exists because Roland's last Fantom-G driver
+was for Windows 8.1 and its kernel driver won't load on Windows 11.
 
-Underneath the vendor class code the synth speaks ordinary USB-MIDI: interface
-2 is subclass `03` (MIDI Streaming) with a standard bulk endpoint pair.
+The Fantom-G presents a vendor-specific USB interface (class `FF`) so Windows
+won't auto-bind to it, but underneath, interface 2 is subclass `03` — MIDI
+Streaming — with a standard bulk endpoint pair:
 
-```
-INTERFACE 2  class=ff sub=03 proto=00
-    EP 0x03  OUT  BULK  512     MIDI to the synth
-    EP 0x82  IN   BULK  512     MIDI from the synth
-```
+    INTERFACE 2  class=ff sub=03 proto=00
+        EP 0x03  OUT  BULK  512     <- MIDI to the Fantom
+        EP 0x82  IN   BULK  512     <- MIDI from the Fantom
 
-Verify with `python usb_probe.py`.
+Interfaces 0 and 1 are the isochronous audio endpoints, unused here.
 
-**3. Get the PTSL SDK**
+To use the raw USB path, WinUSB must be bound to the device (via Zadig).
+No kernel driver, no signature or Memory Integrity changes — WinUSB is
+Microsoft's own signed driver. Reversible from Device Manager.
 
-Not included — Avid licenses it separately and forbids redistribution.
+    python usb_probe.py     dump the USB descriptors
+    python usb_diag.py      full diagnostic: receive test + 16-channel sweep
 
-1. Register at [developer.avid.com/scripting](https://developer.avid.com/scripting/)
-2. Download the Pro Tools Scripting SDK
-3. Extract `PTSL.proto`
-4. Point the tool at it:
+## Commands
 
-```
-setx PTSL_PROTO_PATH "C:\path\to\PTSL.proto"
-```
+    python fantom_stem.py ports
+        List MIDI input/output ports.
 
-**4. Install the Node client dependencies**
+    python fantom_stem.py test --port "Fantom" --channel 5
+        Play a short four-note run on one channel. Use this to confirm the
+        cable and the channel-to-part mapping before a real pass.
 
-```
-npm install @grpc/grpc-js @grpc/proto-loader
-```
+    python fantom_stem.py inspect song.mid
+        Show what's on each part: channel, note count, length in bars,
+        program changes, CCs used. Flags parts that look like arpeggiator
+        or RPS triggers.
 
-Pro Tools runs the PTSL server automatically on `localhost:31416` whenever it's
-open — no configuration needed.
+    python fantom_stem.py plan song.mid
+        Preview the capture layout and write the cue sheet. Sends no MIDI.
 
----
+    python fantom_stem.py run song.mid --port "Fantom"
+        Perform the capture pass.
 
-## Use
+## Options for plan / run
 
-Export your song from the Fantom as a **Format 1** Standard MIDI File. Format 0
-merges every track into one stream and destroys the per-track separation this
-depends on.
+    --parts 1,3,7       Only these parts (default: all)
+    --loops N           Loop iterations per part (default 3)
+    --gap BARS          Silence between parts, for tails (default 2)
+    --lead BARS         Silence before the first part (default 1)
+    --bars N            Loop length in bars (default: auto from file length)
+    --send-programs     Send program changes (default: OFF)
+    --yes               Skip the "press Enter" prompt (run only)
 
-```
-python fantom_stem.py inspect  song.mid          what's on each part
-python fantom_stem.py plan     song.mid          preview, sends nothing
-python fantom_stem.py run      song.mid --usb --per-track --protools
-```
+## Why three loop iterations
 
-Or use the console:
+The **KEEP** column in the cue sheet points at the start of the *final*
+iteration. Use that one.
 
-```
-.\Fantom-Capture.ps1 -Song song.mid
-```
+On the first pass through a loop, reverb tails and delay feedback haven't
+reached steady state — the top of the loop is dry in a way it never is when
+you're actually listening to it cycle. By the third iteration the tail from
+the previous cycle is present, and the stem sounds like what you heard in the
+room.
 
-`.\Install-Shortcut.ps1` puts it on the desktop.
+The gap between parts exists for the same reason: it lets each part's tail
+decay fully so it doesn't bleed into the top of the next one. Increase `--gap`
+if you're using long reverbs.
 
-### Options that matter
+## Why program changes are off by default
 
-| | |
-|---|---|
-| `--per-track` | One Pro Tools track per part, each from timeline zero |
-| `--loops N` | Iterations per part. Keep the last — by then reverb tails have reached steady state |
-| `--tail N` | Seconds to keep recording after the last note, for tails |
-| `--region 9-16` | Capture a bar range. Controllers set earlier are chased in |
-| `--clock` | Send MIDI clock so arpeggiator / RPS parts stay in tempo |
+Your Live Set / Studio Set already has the right patch on every part. Sending
+program changes can only move things away from that. Leave it off unless the
+SMF is the sole source of truth for patch assignment.
 
-### A warning about `--clock`
+## Latency alignment
 
-Clock alone is safe. **Do not enable `--clock-start`** unless you mean it: with
-the synth in slave sync, MIDI Start launches *its* sequencer, playing the whole
-song underneath the part you're isolating. Arpeggiators need clock, not Start.
+Because the whole capture is one continuous recording, every stem shares a
+single latency offset. Nudge the recorded file once so the first part lines up,
+and every other part stays correctly aligned to it automatically. There is no
+per-stem alignment to do.
 
----
+## Cue sheet
 
-## The console
+`<song>_cues.csv` is written next to the SMF, with `start_sec`, `start_bar`,
+`keep_sec`, `keep_bar` and `end_sec` for every part. Set your DAW session tempo
+to match the SMF and the bar numbers land exactly on grid lines.
 
-Three themes over the same state, cycled with **F8** at any time, including
-mid-capture.
+## Transport and clock
 
-- **TURBO** — Borland Turbo Vision. Every control one keystroke away.
-- **PHOSPHOR** — amber CRT. Big numbers, readable across a room mid-pass.
-- **ANSI** — 16-colour BBS art. Colour-coded columns for the results table.
+    python fantom_stem.py transport start --usb
+    python fantom_stem.py transport stop --usb
+    python fantom_stem.py transport continue --usb
 
-| Key | |
-|---|---|
-| `F2` `F3` | Load song / set bar region |
-| `F5` `F6` | Test USB link / arm Pro Tools track |
-| `F8` | Cycle theme |
-| `F9` | Run capture |
-| `Esc` | Abort |
+Sends MIDI real-time messages (Start `FA`, Stop `FC`, Continue `FB`). Add
+`--songpos N` to locate to a beat before starting, or `--mmc` to use MIDI
+Machine Control SysEx instead if the synth ignores real-time messages.
 
-Needs Windows Terminal — PHOSPHOR uses 24-bit colour.
+**These only drive the synth's sequencer if its Sync setting has it following
+external MIDI.** If nothing happens, that setting is the first thing to check.
 
----
+### --clock during a capture pass
 
-## Checking the results
+    python fantom_stem.py run song.mid --usb --clock
 
-You can't hear a capture that ran while you were out of the room, so `tools/`
-reports what listening would have told you:
+Emits MIDI clock at the standard 24 PPQN for the whole pass, bookended with
+Start and Stop. This exists so the synth's **arpeggiator and RPS run in time
+with the notes being sent** — see the limitation below, which `--clock` is the
+answer to.
 
-```
-python tools/check_audio.py   "C:\path\to\session"     peak / RMS per file
-python tools/diagnose_wav.py  take.wav                 clipping, DC, energy map
-python tools/ac_content.py    take.wav                 real audio, or DC and hum?
-python tools/spectrum.py      take.wav                 hum vs drone vs music
-python tools/audio_path_test.py                        is audio reaching the DAW at all?
-```
+## Known limitation: arpeggiator and RPS parts
 
-`audio_path_test.py` is the one to run first if something seems wrong. It
-records silence, then a chord on each of the 16 channels, and tells you whether
-the analogue path exists — a question worth answering before debugging anything
-subtler.
-
----
-
-## Known limitations
-
-**Arpeggiator and RPS parts.** An SMF may hold only the trigger chord rather
-than the resulting pattern. `inspect` flags parts with suspiciously few notes.
-`--clock` usually recovers them.
-
-**Capture runs in real time.** Twenty parts of eight bars at 122 BPM is about
-twelve minutes. The win is that it's unattended, not that it's fast.
-
-**Levels are yours to set.** The tool measures and reports clipping but cannot
-fix it — gain staging happens in the analogue domain.
-
----
-
-## Files
-
-| | |
-|---|---|
-| `fantom_stem.py` | SMF parsing, scheduling, capture |
-| `usb_midi.py` | USB-MIDI transport over libusb |
-| `ptools.js` | PTSL client — tracks, transport, markers |
-| `Fantom-Capture.ps1` | Themed console |
-| `usb_probe.py` `usb_diag.py` `panic.py` | Connection tools |
-| `tools/` | Audio verification |
-
-`panic.py` sends MIDI Stop and all-notes-off on every channel. Keep it handy.
-
----
-
-## Licence
-
-MIT. Not affiliated with Avid or Roland. The PTSL SDK is Avid's and is not
-redistributed here.
+If a part is driven by the synth's arpeggiator, chord memory, or RPS, the SMF
+may contain only the trigger chord rather than the resulting pattern. `inspect`
+flags parts with suspiciously few notes. Those need to be captured the old way,
+or re-recorded to a normal sequencer track on the synth first.

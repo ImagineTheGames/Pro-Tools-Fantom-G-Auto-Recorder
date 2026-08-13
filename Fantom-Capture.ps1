@@ -7,51 +7,27 @@
     being captured, and the Pro Tools session receiving the audio. Drives a full
     pass without touching a transport button.
 
-    Three themes render the same state. Cycle with F8 (or T) at any time,
-    including mid-capture:
-
-      TURBO     Borland Turbo Vision, 1990. Every control one keystroke away.
-      PHOSPHOR  Amber CRT. Big numbers, readable across a room mid-pass.
-      ANSI      16-colour BBS art. Colour-coded columns for the results table.
+    One screen, 16-colour BBS art, with colour-coded columns for the results
+    table and a live input meter during a pass.
 
 .EXAMPLE
     .\Fantom-Capture.ps1
-    .\Fantom-Capture.ps1 -Song mysong.mid -Theme phosphor
-    .\Fantom-Capture.ps1 -Demo          # render all three and exit
+    .\Fantom-Capture.ps1 -Song TOGEEWIZARD.mid
+    .\Fantom-Capture.ps1 -Demo          # render once and exit
 #>
 
 [CmdletBinding()]
 param(
     [string]$Song  = "",
-    [ValidateSet("turbo", "phosphor", "ansi")]
-    [string]$Theme = "turbo",
     [switch]$Demo
 )
 
 $ErrorActionPreference = "Stop"
 
-$script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:Stem = Join-Path $script:Root "fantom_stem.py"
-
-# ptools.js sits beside this script by default; PTOOLS_JS overrides it.
-$script:PTools = $env:PTOOLS_JS
-if (-not $script:PTools) { $script:PTools = Join-Path $script:Root "ptools.js" }
-
-# Find Python: PYTHON env var, then PATH, then the usual per-user install.
-$script:Python = $env:PYTHON
-if (-not $script:Python -or -not (Test-Path $script:Python)) {
-    $cmd = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($cmd) { $script:Python = $cmd.Source }
-}
-if (-not $script:Python -or -not (Test-Path $script:Python)) {
-    $guess = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs\Python") -Filter python.exe `
-             -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($guess) { $script:Python = $guess.FullName }
-}
-if (-not $script:Python) {
-    Write-Host "Python not found. Set the PYTHON environment variable or add it to PATH."
-    exit 1
-}
+$script:Root   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:Python = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"
+$script:Stem   = Join-Path $script:Root "fantom_stem.py"
+$script:PTools = "C:\Users\Rei\protools-mcp-server\ptools.js"
 
 # ============================================================== primitives ==
 
@@ -126,10 +102,12 @@ function Home         { [Console]::Write("$E[H") }
 # =================================================================== state ==
 
 $script:S = @{
-    Theme = $Theme; SongFile = $Song; SongName = "(none loaded)"
+    SongFile = $Song; SongName = "(none loaded)"
     Bpm = 0.0; Bars = 0.0; TimeSig = "4/4"; Parts = @()
     Loops = 2; Gap = 2; Region = ""; Clock = $false
     PerTrack = $true; Tail = 4.0; CurTrack = ""
+    Session = "C:\ProTools\2026\OGWizard"
+    Scroll = 0; Cursor = 0; Follow = $true
     DeviceOk = $false; UsbId = "-"; Endpoint = "-"
     PtSession = "not connected"; PtRate = "-"; PtTrack = "Fantom Stems"
     PtArmed = $false; PtOk = $false
@@ -137,9 +115,9 @@ $script:S = @{
     Elapsed = "0:00.00"; Total = "0:00.00"; Sent = 0
     MeanLate = 0.0; WorstLate = 0.0; Markers = 0
     Message = ""; Cues = @()
+    Levels = @{}; Peak = -999.0; Rms = -999.0; T0 = $null; Rec = $false
 }
 
-$THEMES = @("turbo", "phosphor", "ansi")
 $W = 78
 
 # ============================================================== collectors ==
@@ -200,7 +178,190 @@ function Update-Song {
                           Notes=[int]$Matches[4]; Bars=[double]$Matches[5] }
         }
     }
-    $script:S.Parts = $parts
+    $script:S.Parts  = $parts
+    $script:S.Cursor = 0
+    $script:S.Scroll = 0
+    $script:S.Follow = $true
+}
+
+# ================================================================== meter ===
+#
+# Where a level reading can come from, given what is actually available:
+#
+#   PTSL          exposes no metering command at all.
+#   the interface is held exclusively by the ASIO driver, so it cannot be
+#                 opened a second time to listen in.
+#   the record file IS readable while Pro Tools writes it.
+#
+# So the meter reads the tail of the file being recorded. Two Windows details
+# make this work: the directory entry does not update while a file is open --
+# only a handle reports the true length -- and Pro Tools flushes about every
+# two seconds, which is the meter's real update rate. It lags a beat behind
+# the sound in the room. It is not lying about the level.
+
+$script:Meter = @{ Path = ""; Data = -1; Bits = 24; Size = 0; Pos = 0 }
+
+function Find-RecordFile { param([string]$Track)
+    $dir = Join-Path $script:S.Session "Audio Files"
+    if (-not $Track -or -not (Test-Path $dir)) { return $null }
+    # Sort by the take number in the name: LastWriteTime is stale on the very
+    # file we care about, because Pro Tools still has it open.
+    $f = Get-ChildItem $dir -Filter *.L.wav -ErrorAction SilentlyContinue |
+         Where-Object { $_.Name.StartsWith($Track + "_") } |
+         Sort-Object { [int]([regex]::Match($_.Name, '_(\d+)\.L\.wav$').Groups[1].Value) } -Descending |
+         Select-Object -First 1
+    if ($f) { return $f.FullName }
+    return $null
+}
+
+function Get-WavLayout { param([IO.FileStream]$Fs)
+    # Pro Tools puts JUNK, bext, minf and elm1 chunks ahead of the audio, so
+    # the data offset is around 16 KB, not the textbook 44 bytes.
+    $h = [byte[]]::new(65536)
+    $Fs.Position = 0
+    $n = $Fs.Read($h, 0, $h.Length)
+    $i = 12
+    $bits = 24
+    while ($i + 8 -le $n) {
+        $id = [Text.Encoding]::ASCII.GetString($h, $i, 4)
+        $sz = [int64][BitConverter]::ToUInt32($h, $i + 4)
+        if ($id -eq 'fmt ' -and $i + 24 -le $n) { $bits = [BitConverter]::ToUInt16($h, $i + 22) }
+        if ($id -eq 'data') { return @{ Offset = $i + 8; Bits = $bits; Size = $sz } }
+        $i += 8 + $sz + ($sz % 2)
+        if ($sz -le 0) { break }
+    }
+    return @{ Offset = -1; Bits = $bits; Size = 0 }
+}
+
+function Update-Meter {
+    $track = $script:S.CurTrack
+    if (-not $track) { return }
+    $path = Find-RecordFile $track
+    if (-not $path) { return }
+    if ($path -ne $script:Meter.Path) {
+        $script:Meter.Path = $path
+        $script:Meter.Data = -1
+        $script:Meter.Pos  = 0
+    }
+    try { $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite') } catch { return }
+    try {
+        if ($script:Meter.Data -lt 0) {
+            $lay = Get-WavLayout $fs
+            if ($lay.Offset -lt 0) { return }
+            $script:Meter.Data = $lay.Offset
+            $script:Meter.Bits = $lay.Bits
+            $script:Meter.Size = $lay.Size
+            $script:Meter.Pos  = $lay.Offset
+        }
+        $w   = [int]($script:Meter.Bits / 8)
+        $len = $fs.Length
+
+        # A finished file carries regn/umid chunks after the audio -- tens of
+        # kilobytes of metadata that read as full-scale noise if you treat the
+        # end of the file as the end of the audio. Trust the data chunk size
+        # when it is filled in; while recording it is still zero, and then the
+        # end of the file genuinely is the end of the audio.
+        $end = $len
+        $sz  = [int64]$script:Meter.Size
+        if ($sz -gt 0 -and $script:Meter.Data + $sz -le $len) { $end = $script:Meter.Data + $sz }
+        if ($end -le $script:Meter.Pos + $w) { return }
+
+        # Only the newest audio matters. If a flush arrived while we were busy,
+        # skip forward rather than working through the backlog.
+        $window = 48000 * $w
+        $from = [int64][math]::Max([double]$script:Meter.Pos, [double]($end - $window))
+        $from = $from - (($from - $script:Meter.Data) % $w)
+        $count = [int][math]::Min([double]($end - $from), 400000.0)
+        $buf = [byte[]]::new($count)
+        $fs.Position = $from
+        $got = $fs.Read($buf, 0, $count)
+        $script:Meter.Pos = $from + $got
+
+        $ns = [int]($got / $w)
+        if ($ns -lt 1) { return }
+        # Cap the work at a fixed number of samples so the cost per poll is flat
+        # however much audio arrived. Twelve thousand keeps a loop this shape
+        # under about 15 ms, and decimating that lightly costs peak accuracy
+        # well under a decibel on musical material.
+        $step = [math]::Max(1, [int]($ns / 12000))
+        $full = 8388608.0
+        if ($w -eq 2) { $full = 32768.0 }
+        $peak = 0.0; $acc = 0.0; $k = 0
+        for ($s = 0; $s -lt $ns; $s += $step) {
+            $o = $s * $w
+            if ($w -eq 3) {
+                $hi = [int]$buf[$o + 2]
+                if ($hi -gt 127) { $hi -= 256 }      # PowerShell will not cast byte->sbyte
+                # [int] on the left is load-bearing: -bor takes the type of its
+                # left operand, so a [byte] there truncates the result to eight
+                # bits and every sample comes back as its own low byte.
+                $v = [double](([int]$buf[$o]) -bor (([int]$buf[$o + 1]) -shl 8) -bor ($hi -shl 16))
+            } else {
+                $v = [double][BitConverter]::ToInt16($buf, $o)
+            }
+            $a = [math]::Abs($v)
+            if ($a -gt $peak) { $peak = $a }
+            $acc += $v * $v
+            $k++
+        }
+        if ($k -lt 1) { return }
+        $script:S.Peak = Db ($peak / $full)
+        $script:S.Rms  = Db ([math]::Sqrt($acc / $k) / $full)
+        if ($script:S.CurPart -gt 0) {
+            $n = $script:S.CurPart
+            $held = $script:S.Levels[$n]
+            if ($null -eq $held -or $script:S.Peak -gt $held) { $script:S.Levels[$n] = $script:S.Peak }
+        }
+    } finally { $fs.Close() }
+}
+
+function Db { param([double]$Frac)
+    if ($Frac -le 0.0000001) { return -999.0 }
+    return 20.0 * [math]::Log10($Frac)
+}
+
+# -60 dBFS empty through 0 dBFS full, coloured by headroom rather than by
+# position, so the colour means the same thing whatever the bar length.
+function Level-Bar { param([double]$Db, [int]$Width = 10)
+    if ($Db -le -900) { return (C 'dgray') + (Rep 0x2591 $Width) }
+    $f = ($Db + 60.0) / 60.0
+    if ($f -lt 0) { $f = 0.0 }
+    if ($f -gt 1) { $f = 1.0 }
+    $n = [int][math]::Round($Width * $f)
+    if ($n -lt 1 -and $Db -gt -900) { $n = 1 }
+    $col = C 'lgreen'
+    if ($Db -gt -12) { $col = C 'yellow' }
+    if ($Db -gt -3)  { $col = C 'lred' }
+    return $col + (Rep 0x2588 $n) + (C 'dgray') + (Rep 0x2591 ($Width - $n))
+}
+
+function Db-Text { param([double]$Db)
+    if ($Db -le -900) { return "  --  " }
+    return ("{0,6:0.0}" -f $Db)
+}
+
+function Get-VisibleRows { return 12 }
+
+# Keep the cursor on screen: scroll only when it would leave the window.
+function Clamp-Scroll { param([int]$Rows)
+    $n = $script:S.Parts.Count
+    if ($n -eq 0) { $script:S.Cursor = 0; $script:S.Scroll = 0; return 0 }
+    if ($script:S.Cursor -lt 0) { $script:S.Cursor = 0 }
+    if ($script:S.Cursor -ge $n) { $script:S.Cursor = $n - 1 }
+    if ($script:S.Cursor -lt $script:S.Scroll) { $script:S.Scroll = $script:S.Cursor }
+    if ($script:S.Cursor -ge $script:S.Scroll + $Rows) {
+        $script:S.Scroll = $script:S.Cursor - $Rows + 1
+    }
+    $max = [math]::Max(0, $n - $Rows)
+    if ($script:S.Scroll -gt $max) { $script:S.Scroll = $max }
+    if ($script:S.Scroll -lt 0) { $script:S.Scroll = 0 }
+    return $script:S.Scroll
+}
+
+function Move-Cursor { param([int]$Delta)
+    $n = $script:S.Parts.Count
+    if ($n -eq 0) { return }
+    $script:S.Cursor = [math]::Max(0, [math]::Min($n - 1, $script:S.Cursor + $Delta))
 }
 
 function Get-EstimatedPass {
@@ -218,200 +379,126 @@ function Get-EstimatedPass {
     return ("{0}:{1:00}" -f [int]($tot / 60), [int]($tot % 60))
 }
 
-# =========================================================== THEME: TURBO ===
-
-function TvFrame { param([string]$Title)
-    $inner = $W - 4
-    $t = " $Title "
-    $pad = $inner - $t.Length
-    if ($pad -lt 2) { $pad = 2 }
-    $l = [math]::Floor($pad / 2); $r = $pad - $l
-    Line ((CB 'lcyan' 'blue') + "  " + [char]0x2554 + (Rep 0x2550 $l) + (C 'yellow') + $t +
-          (C 'lcyan') + (Rep 0x2550 $r) + [char]0x2557)
-}
-function TvRow { param([string]$A, [string]$B)
-    $body = (FitV $A 36) + (FitV $B 36)
-    Line ((CB 'lcyan' 'blue') + "  " + [char]0x2551 + (C 'lgray') + (FitV $body ($W - 4)) +
-          (C 'lcyan') + [char]0x2551)
-}
-function TvClose {
-    Line ((CB 'lcyan' 'blue') + "  " + [char]0x255A + (Rep 0x2550 ($W - 4)) + [char]0x255D)
-}
-function TvBlank { Line ((CB 'lgray' 'blue') + (" " * $W)) }
-
-function Render-Turbo {
-    Line ((CB 'black' 'lgray') + (Plain "  File   Device   Song   Capture   Options   Help" $W))
-    TvBlank
-
-    $dev = (C 'white') + "Fantom G  "
-    if ($script:S.DeviceOk) { $dev += (C 'lgreen') + "ONLINE" } else { $dev += (C 'lred') + "OFFLINE" }
-    $trk = (C 'white') + $script:S.PtTrack + "  "
-    if ($script:S.PtArmed) { $trk += (C 'lgreen') + "ARMED" } else { $trk += (C 'yellow') + "not armed" }
-
-    TvFrame "Hardware & Session"
-    TvRow ((C 'lcyan') + "Device     " + $dev) ((C 'lcyan') + "Session    " + (C 'white') + $script:S.PtSession)
-    TvRow ((C 'lcyan') + "USB        " + (C 'white') + "$($script:S.UsbId) $($script:S.Endpoint)") `
-          ((C 'lcyan') + "Rate       " + (C 'white') + $script:S.PtRate)
-    TvRow ((C 'lcyan') + "Transport  " + (C 'white') + "raw bulk (WinUSB)") ((C 'lcyan') + "Track      " + $trk)
-    TvClose
-    TvBlank
-
-    $region = $script:S.Region
-    if (-not $region) { $region = "whole song" }
-    TvFrame $script:S.SongName
-    TvRow ((C 'lcyan') + "Tempo      " + (C 'white') + "$($script:S.Bpm) BPM  $($script:S.TimeSig)") `
-          ((C 'lcyan') + "Loops      " + (C 'white') + "$($script:S.Loops)   gap $($script:S.Gap) bars")
-    TvRow ((C 'lcyan') + "Length     " + (C 'white') + "$($script:S.Bars) bars") `
-          ((C 'lcyan') + "Parts      " + (C 'white') + "$($script:S.Parts.Count)")
-    TvRow ((C 'lcyan') + "Region     " + (C 'white') + $region) `
-          ((C 'lcyan') + "Est. pass  " + (C 'yellow') + (Get-EstimatedPass))
-    $mode = "one track per part"
-    if (-not $script:S.PerTrack) { $mode = "single continuous pass" }
-    $clk = "off"
-    if ($script:S.Clock) { $clk = "24 PPQN" }
-    TvRow ((C 'lcyan') + "Mode       " + (C 'white') + $mode) `
-          ((C 'lcyan') + "Tail/Clock " + (C 'white') + ("{0:0.0}s / {1}" -f $script:S.Tail, $clk))
-    TvClose
-    TvBlank
-
-    Line ((CB 'black' 'lgray') + (Plain "   #   PART                  CH   NOTES   BARS   STATUS" $W))
-    $n = 0
-    foreach ($p in $script:S.Parts) {
-        if ($n -ge 8) { break }
-        $row = "  " + ("{0:00}" -f $p.N) + "   " + (Plain $p.Name 20) + "  " + ("{0,2}" -f $p.Ch) +
-               "  " + ("{0,6}" -f $p.Notes) + "   " + ("{0,4:0.0}" -f $p.Bars) + "   ready"
-        if ($n -eq 0 -and $script:S.Phase -eq "idle") {
-            Line ((CB 'black' 'cyan') + (Plain $row $W))
-        } else {
-            Line ((CB 'lgray' 'blue') + (Plain $row $W))
-        }
-        $n++
-    }
-    if ($script:S.Parts.Count -eq 0) {
-        Line ((CB 'dgray' 'blue') + (Plain "        no song loaded - press F2" $W))
-    } elseif ($script:S.Parts.Count -gt 8) {
-        Line ((CB 'dgray' 'blue') + (Plain ("        ...$($script:S.Parts.Count - 8) more") $W))
-    }
-
-    TvBlank
-    if ($script:S.Message) {
-        Line ((CB 'yellow' 'blue') + (Plain ("  " + $script:S.Message) $W))
-    }
-    Line ((CB 'black' 'lgray') +
-          (Plain "  F1 Help  F2 Load  F3 Region  F5 Test  F6 Arm  F8 Theme  F9 CAPTURE  F10 Quit" $W))
-}
-
-# ======================================================== THEME: PHOSPHOR ===
-
-function Render-Phosphor {
-    $A  = RGB 255 176 0
-    $Ad = RGB 138 96 0
-    $Ah = RGB 255 224 138
-
-    Line ""
-    Line ($A + "  FANTOM STEM CAPTURE   " + $Ad + "v1.0" + "        " + $Ad + $script:S.SongName)
-    Line ($Ad + "  " + (Rep 0x2500 72))
-    Line ""
-
-    if ($script:S.Phase -eq "running") {
-        Line ($Ad + "  CAPTURING PART $($script:S.CurPart) OF $($script:S.Parts.Count)")
-        Line ($Ah + "  $($script:S.CurName)   " + $Ad + "ch$($script:S.CurCh)")
-        if ($script:S.CurTrack) { Line ($Ad + "  -> " + $Ah + $script:S.CurTrack) }
-    } elseif ($script:S.Phase -eq "done") {
-        Line ($Ad + "  PASS COMPLETE")
-        Line ($Ah + "  $($script:S.Parts.Count) PARTS   " + $Ad + "$($script:S.Markers) MARKERS")
-    } else {
-        Line ($Ad + "  READY")
-        Line ($Ah + "  $($script:S.Bpm) BPM   " + $Ad + "$($script:S.Bars) BARS   $($script:S.Parts.Count) PARTS")
-    }
-    Line ""
-
-    $full = 40
-    $done = [int]([math]::Round($full * ($script:S.PassPct / 100.0)))
-    if ($done -lt 0) { $done = 0 }
-    if ($done -gt $full) { $done = $full }
-    Line ($Ad + "  PASS   " + $A + (Rep 0x2588 $done) + $Ad + (Rep 0x2591 ($full - $done)) +
-          "  " + $Ah + ("{0,3}" -f $script:S.PassPct) + "%   " + $Ad +
-          "$($script:S.Elapsed) / $($script:S.Total)")
-    Line ""
-
-    $devTxt = "offline"
-    if ($script:S.DeviceOk) { $devTxt = "$($script:S.UsbId) online" }
-    $armTxt = "not armed"
-    if ($script:S.PtArmed) { $armTxt = "armed" }
-    $clkTxt = "off"
-    if ($script:S.Clock) { $clkTxt = "24 PPQN locked" }
-
-    # Every -f expression needs its own parentheses: PowerShell binds the comma
-    # tighter than the format operator, so an unwrapped pair collapses into one
-    # string and the second column vanishes.
-    $rows = @(
-        @("DEVICE",     $devTxt),
-        @("SESSION",    $script:S.PtSession),
-        @("TRACK",      $armTxt),
-        @("RATE",       $script:S.PtRate),
-        @("LOOPS",      "$($script:S.Loops)  gap $($script:S.Gap) bars"),
-        @("CLOCK",      $clkTxt),
-        @("MESSAGES",   ("{0:N0}" -f $script:S.Sent)),
-        @("MARKERS",    "$($script:S.Markers) placed"),
-        @("MEAN LATE",  ("{0:0.000} ms" -f $script:S.MeanLate)),
-        @("WORST LATE", ("{0:0.000} ms" -f $script:S.WorstLate))
-    )
-    for ($i = 0; $i -lt $rows.Count; $i += 2) {
-        $l = $Ad + "  " + (Plain $rows[$i][0] 12) + $A + (Plain $rows[$i][1] 24)
-        if ($i + 1 -lt $rows.Count) {
-            $l += $Ad + (Plain $rows[$i+1][0] 12) + $A + $rows[$i+1][1]
-        }
-        Line $l
-    }
-
-    Line ""
-    Line ($Ad + "  " + (Rep 0x2500 72))
-    Line ($Ad + "  F2 LOAD   F6 ARM   F8 THEME   F9 CAPTURE   ESC ABORT   F10 QUIT")
-    if ($script:S.Message) { Line ($Ah + "  $($script:S.Message)") }
-}
-
 # ============================================================ THEME: ANSI ===
+
+# A 3-row block font, 5 columns per glyph. Enough to spell the banner in the
+# BBS-art idiom the ANSI theme is quoting, without eating half the screen.
+$GLYPHS = @{
+    'F' = @('█████','███  ','█    ')
+    'A' = @('▄███▄','█████','█   █')
+    'N' = @('█▄  █','█ ▀▄█','█   █')
+    'T' = @('█████','  █  ','  █  ')
+    'O' = @('▄███▄','█   █','▀███▀')
+    'M' = @('█▄ ▄█','█ ▀ █','█   █')
+    'S' = @('▄████','▀███▄','████▀')
+    'E' = @('█████','███  ','█████')
+    ' ' = @('     ','     ','     ')
+}
+
+function Banner { param([string]$Text)
+    $rows = @('', '', '')
+    foreach ($ch in $Text.ToCharArray()) {
+        $g = $GLYPHS["$ch"]
+        if (-not $g) { $g = $GLYPHS[' '] }
+        for ($r = 0; $r -lt 3; $r++) { $rows[$r] += $g[$r] + ' ' }
+    }
+    return $rows
+}
 
 function Render-Ansi {
     Line ""
-    Line ((C 'lmagenta') + "  " + (Rep 0x2584 22) + "   " + (C 'lcyan') + (Rep 0x2584 16))
-    Line ((C 'magenta')  + "  FANTOM STEM CAPTURE       " + (C 'cyan') + "RESULTS")
-    Line ((C 'dgray') + "  " + (Rep 0x2500 72))
-
-    $state = (CB 'black' 'lgray') + " READY " + $RESET
-    if ($script:S.Phase -eq "running") { $state = (CB 'black' 'cyan') + " CAPTURING " + $RESET }
-    if ($script:S.Phase -eq "done")    { $state = (CB 'black' 'lcyan') + " PASS COMPLETE " + $RESET }
-    $dot = [char]0x00B7
-    Line ("  " + $state + " " + (C 'dgray') + $dot + " " + (C 'white') + $script:S.SongName +
-          " " + (C 'dgray') + $dot + " " + (C 'yellow') + "$($script:S.Parts.Count) parts" +
-          " " + (C 'dgray') + $dot + " " + (C 'yellow') + $script:S.Total +
-          " " + (C 'dgray') + $dot + " " + (C 'lgreen') + "$($script:S.Markers) markers")
-    Line ((C 'dgray') + "  " + (Rep 0x2500 72))
-    Line ((CB 'black' 'lcyan') + (Plain "  #   PART                  CH   KEEP AT     NOTES   LEVEL        MARK" $W))
-
-    $i = 0
-    foreach ($p in $script:S.Parts) {
-        if ($i -ge 10) { break }
-        $keep = "-"
-        $mark = (C 'dgray') + $dot
-        if ($script:S.Cues.Count -gt $i) {
-            $keep = $script:S.Cues[$i]
-            $mark = (C 'lgreen') + [char]0x221A
-        }
-        $mn = [int][math]::Floor($p.Notes / 20)
-        if ($mn -lt 1)  { $mn = 1 }
-        if ($mn -gt 10) { $mn = 10 }
-        $meter = (C 'lgreen') + (Rep 0x2588 $mn) + (C 'dgray') + (Rep 0x2591 (10 - $mn))
-        Line ("  " + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'white') + (Plain $p.Name 20) +
-              " " + (C 'lblue') + ("{0,2}" -f $p.Ch) + "   " + (C 'yellow') + (Plain $keep 10) +
-              " " + (C 'dgray') + ("{0,5}" -f $p.Notes) + "   " + $meter + "   " + $mark)
-        $i++
+    # drop shadow: the same glyphs offset a row and dimmed, as ANSI art did
+    $b = Banner 'FANTOM'
+    $tint = @((C 'lmagenta'), (C 'magenta'), (C 'magenta'))
+    for ($r = 0; $r -lt 3; $r++) {
+        Line ("  " + $tint[$r] + $b[$r] + (C 'dgray') + "  " +
+              $(if ($r -eq 1) { (C 'lcyan') + "S T E M   C A P T U R E" } else { "" }))
     }
+    Line ((C 'dgray') + "  " + (Rep 0x2500 72))
+
+    $dot = [char]0x00B7
+    $state = (CB 'black' 'lgray') + " READY " + $RESET
+    if ($script:S.Phase -eq "running") {
+        # A blinking red dot is the one thing that reads as "running" at a
+        # glance -- a static label looks the same as a hung process.
+        $blink = (C 'dgray') + [char]0x25CF
+        if ($script:S.Rec) { $blink = (C 'lred') + [char]0x25CF }
+        $state = (CB 'black' 'red') + " REC " + $RESET + " " + $blink
+    }
+    if ($script:S.Phase -eq "done") { $state = (CB 'black' 'lcyan') + " PASS COMPLETE " + $RESET }
+
+    $what = "$($script:S.Parts.Count) parts"
+    if ($script:S.Phase -eq "running" -and $script:S.CurPart -gt 0) {
+        $what = "part $($script:S.CurPart)/$($script:S.Parts.Count)  $($script:S.CurName)"
+    }
+    Line ("  " + $state + " " + (C 'dgray') + $dot + " " + (C 'white') + $script:S.SongName +
+          " " + (C 'dgray') + $dot + " " + (C 'yellow') + $what +
+          " " + (C 'dgray') + $dot + " " + (C 'yellow') + "$($script:S.Elapsed) / $($script:S.Total)" +
+          " " + (C 'dgray') + $dot + " " + (C 'lgreen') + "$($script:S.Markers) markers")
+
+    # Tempo belongs on screen: it is the one number you have to match by hand
+    # in Pro Tools, because PTSL has no way to set a session's tempo.
+    $bpm = "-- BPM"
+    if ($script:S.Bpm -gt 0) { $bpm = "{0:0.##} BPM" -f $script:S.Bpm }
+    $bars = "-"
+    if ($script:S.Bars -gt 0) { $bars = "{0:0.##} bars" -f $script:S.Bars }
+    $reg = "whole song"
+    if ($script:S.Region) { $reg = "bars $($script:S.Region)" }
+    Line ("  " + (C 'lmagenta') + $bpm + " " + (C 'dgray') + $dot + " " +
+          (C 'white') + $script:S.TimeSig + " " + (C 'dgray') + $dot + " " +
+          (C 'lgray') + $bars + " " + (C 'dgray') + $dot + " " +
+          (C 'lgray') + "$($script:S.Loops) loops" + " " + (C 'dgray') + $dot + " " +
+          (C 'lgray') + "tail $($script:S.Tail)s" + " " + (C 'dgray') + $dot + " " +
+          (C 'lgray') + $reg)
+
+    # The pass bar: without it there is no sense of how far in you are.
+    $full = 60
+    $done = [int][math]::Round($full * ($script:S.PassPct / 100.0))
+    if ($done -lt 0) { $done = 0 }
+    if ($done -gt $full) { $done = $full }
+    Line ("  " + (C 'lcyan') + (Rep 0x2588 $done) + (C 'dgray') + (Rep 0x2591 ($full - $done)) +
+          " " + (C 'white') + ("{0,3}%" -f $script:S.PassPct))
+    Line ((C 'dgray') + "  " + (Rep 0x2500 72))
+    Line ((CB 'black' 'lcyan') + (Plain "  #   PART                  CH   KEEP AT      dBFS  LEVEL        MARK" $W))
+
+    $rows = 12
     if ($script:S.Parts.Count -eq 0) {
         Line ((C 'dgray') + "       no song loaded " + [char]0x2014 + " press F2")
-    } elseif ($script:S.Parts.Count -gt 10) {
-        Line ((C 'dgray') + "  ..  $($script:S.Parts.Count - 10) more parts")
+    } else {
+        $top = Clamp-Scroll $rows
+        for ($i = 0; $i -lt $rows; $i++) {
+            $idx = $top + $i
+            if ($idx -ge $script:S.Parts.Count) { Line ""; continue }
+            $p = $script:S.Parts[$idx]
+            $keep = "-"
+            $mark = (C 'dgray') + $dot
+            if ($script:S.Cues.Count -gt $idx) {
+                $keep = $script:S.Cues[$idx]
+                $mark = (C 'lgreen') + [char]0x221A
+            }
+            # The level is measured, not inferred: live off the record file for
+            # the part being captured, held at its peak for parts already done.
+            $live = ($script:S.Phase -eq "running" -and $p.N -eq $script:S.CurPart)
+            if ($live) {
+                $db = $script:S.Peak
+            } else {
+                $db = $script:S.Levels[$p.N]
+                if ($null -eq $db) { $db = -999.0 }
+            }
+            $meter = Level-Bar $db 10
+            if ($live) {
+                $mark = (C 'lred') + [char]0x25CF
+                if (-not $script:S.Rec) { $mark = (C 'red') + [char]0x25CF }
+            }
+            $cur = "  "
+            if ($idx -eq $script:S.Cursor) { $cur = (C 'lcyan') + [char]0x25BA + " " }
+            Line ($cur + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'white') + (Plain $p.Name 20) +
+                  " " + (C 'lblue') + ("{0,2}" -f $p.Ch) + "   " + (C 'yellow') + (Plain $keep 10) +
+                  " " + (C 'dgray') + (Db-Text $db) + "  " + $meter + "   " + $mark)
+        }
+        $shown = [math]::Min($rows, $script:S.Parts.Count - $top)
+        Line ((C 'dgray') + ("  {0}-{1} of {2}   " -f ($top + 1), ($top + $shown),
+              $script:S.Parts.Count) + [char]0x2191 + [char]0x2193 + " scroll")
     }
 
     $clkTxt = "off"
@@ -421,31 +508,34 @@ function Render-Ansi {
           ("mean {0:0.000} ms " -f $script:S.MeanLate) + $dot +
           (" worst {0:0.000} ms" -f $script:S.WorstLate) + "      " +
           (C 'lcyan') + "CLOCK  " + (C 'lgray') + $clkTxt)
+    $src = $script:S.PtTrack
+    if ($script:S.CurTrack) { $src = $script:S.CurTrack }
     Line ((C 'lcyan') + "  AUDIO   " + (C 'lgray') + "$($script:S.PtRate) " + $dot +
-          " $($script:S.PtTrack) " + $dot + " $($script:S.PtSession)")
+          " $src " + $dot + " $($script:S.PtSession)")
+    if ($script:S.Phase -eq "running") {
+        Line ((C 'lcyan') + "  INPUT   " + (Level-Bar $script:S.Peak 24) + " " +
+              (C 'white') + (Db-Text $script:S.Peak) + (C 'dgray') + " peak   " +
+              (C 'lgray') + (Db-Text $script:S.Rms) + (C 'dgray') + " rms" +
+              "   (from the record file, ~2 s behind)")
+    }
     if ($script:S.Message) { Line ((C 'brown') + "  NOTE    $($script:S.Message)") }
     Line ((C 'dgray') + "  " + (Rep 0x2500 72))
-    Line ("  " + (C 'lgreen') + "[F2]" + (C 'lgray') + " load  " + (C 'lgreen') + "[F6]" + (C 'lgray') +
-          " arm  " + (C 'lgreen') + "[F8]" + (C 'lgray') + " theme  " + (C 'lgreen') + "[F9]" +
-          (C 'lgray') + " capture  " + (C 'lgreen') + "[F10]" + (C 'lgray') + " quit")
+    Line ("  " + (C 'lgreen') + "[F2]" + (C 'lgray') + " song  " +
+          (C 'lgreen') + "[F3]" + (C 'lgray') + " region  " +
+          (C 'lgreen') + "[F6]" + (C 'lgray') + " arm  " +
+          (C 'lgreen') + "[F7]" + (C 'lgray') + " verify  " +
+          (C 'lgreen') + "[A]" + (C 'lgray') + " trim  " +
+          (C 'lgreen') + "[L]" + (C 'lgray') + " loops  " +
+          (C 'lgreen') + "[F9]" + (C 'lgray') + " capture  " +
+          (C 'lgreen') + "[F10]" + (C 'lgray') + " quit")
 }
 
 # ================================================================= render ===
 
 function Render {
     Home
-    switch ($script:S.Theme) {
-        "turbo"    { Render-Turbo }
-        "phosphor" { Render-Phosphor }
-        "ansi"     { Render-Ansi }
-    }
+    Render-Ansi
     [Console]::Write("$RESET$E[J")
-}
-
-function Switch-Theme {
-    $i = [array]::IndexOf($THEMES, $script:S.Theme)
-    $script:S.Theme = $THEMES[($i + 1) % $THEMES.Count]
-    Clear-Screen
 }
 
 # ================================================================ capture ===
@@ -453,9 +543,12 @@ function Switch-Theme {
 function Start-Capture {
     if (-not $script:S.SongFile) { $script:S.Message = "Load a song first (F2)"; return }
     $script:S.Phase = "running"; $script:S.PassPct = 0; $script:S.Cues = @(); $script:S.Message = ""
+    $script:S.Follow = $true
     Clear-Screen
 
-    $a = @($script:Stem, "run", (Join-Path $script:Root $script:S.SongFile),
+    # -u matters: with stdout on a pipe Python block-buffers 8 KB, so progress
+    # lines sat in the buffer instead of reaching the screen.
+    $a = @("-u", $script:Stem, "run", (Join-Path $script:Root $script:S.SongFile),
            "--usb", "--loops", $script:S.Loops, "--gap", $script:S.Gap,
            "--protools", "--pt-track", $script:S.PtTrack, "--yes")
     if ($script:S.PerTrack) { $a += @("--per-track", "--tail", $script:S.Tail, "--lead", 0) }
@@ -469,91 +562,281 @@ function Start-Capture {
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.CreateNoWindow = $true
-    $proc = [System.Diagnostics.Process]::Start($psi)
 
-    # Draw once immediately. The first progress line doesn't arrive until after
-    # the Pro Tools pre-roll and the lead-in bar, and an empty screen for those
-    # several seconds reads as a crash.
+    # Read the child's output through an event into a queue rather than calling
+    # ReadLine. In per-track mode a part only prints its line once it has
+    # finished, so a blocking read froze the whole interface -- no clock, no
+    # meter, no keys -- for the forty seconds each part takes.
+    $q = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $proc.EnableRaisingEvents = $true
+    $sub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived `
+        -MessageData $q -Action { if ($null -ne $EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) } }
+    [void]$proc.Start()
+    $proc.BeginOutputReadLine()
+
+    $script:S.T0 = Get-Date
+    $script:S.Levels = @{}
+    $script:S.Peak = -999.0
     $script:S.Message = "starting Pro Tools, then rolling..."
     Render
 
+    $tick = 0
     while ($true) {
-        if ($proc.HasExited -and $proc.StandardOutput.EndOfStream) { break }
-        $ln = $proc.StandardOutput.ReadLine()
-        if ($null -eq $ln) { if ($proc.HasExited) { break } else { continue } }
+        if ($proc.HasExited -and $q.Count -eq 0) { break }
 
-        # per-track mode:  " 1/20  Track 1   ch1   0:17.70  -> 01 Track 1"
-        if ($ln -match '^\s+(\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)\s+(\d+:\d+\.\d+)\s+->\s+(.+)$') {
-            $script:S.CurPart  = [int]$Matches[1]
-            $script:S.CurName  = $Matches[3].Trim()
-            $script:S.CurCh    = [int]$Matches[4]
-            $script:S.Elapsed  = $Matches[5]
-            $script:S.CurTrack = $Matches[6].Trim()
-            $script:S.Cues    += $Matches[5]
-            $tot = [int]$Matches[2]
-            if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * $script:S.CurPart / $tot) }
-            $script:S.Message = ""
-            Render
-            continue
+        while ($q.Count -gt 0) {
+            $ln = [string]$q.Dequeue()
+            Read-CaptureLine $ln
         }
-        if ($ln -match 'FAILED:') { $script:S.Message = $ln.Trim(); Render; continue }
-        if ($ln -match 'Mode: one Pro Tools track') { $script:S.Message = "per-track mode"; Render; continue }
 
-        if ($ln -match '\[(\d+:\d+\.\d+)\]\s+part (\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)') {
-            $script:S.Elapsed = $Matches[1]
-            $script:S.CurPart = [int]$Matches[2]
-            $script:S.CurName = $Matches[4].Trim()
-            $script:S.CurCh   = [int]$Matches[5]
-            $script:S.Cues   += $Matches[1]
-            $tot = [int]$Matches[3]
-            if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * $script:S.CurPart / $tot) }
-            Render
+        # Everything that must keep moving while the child is silent.
+        $tick++
+        $script:S.Rec = (($tick % 4) -lt 2)
+        if ($script:S.T0) {
+            $el = (Get-Date) - $script:S.T0
+            $script:S.Elapsed = "{0}:{1:00}.{2:00}" -f `
+                [int]$el.TotalMinutes, $el.Seconds, [int]($el.Milliseconds / 10)
         }
-        elseif ($ln -match 'Total pass length:\s+(\S+)') { $script:S.Total = $Matches[1]; Render }
-        elseif ($ln -match 'Done\. (\d+) track\(s\) recorded') {
-            $script:S.Markers = [int]$Matches[1]; $script:S.Message = "$($Matches[1]) track(s) recorded"
-        }
-        elseif ($ln -match 'Done\. (\d+) messages')      { $script:S.Sent = [int]$Matches[1] }
-        elseif ($ln -match 'mean lateness ([\d.]+) ms, worst ([\d.]+)') {
-            $script:S.MeanLate = [double]$Matches[1]; $script:S.WorstLate = [double]$Matches[2]
-        }
-        elseif ($ln -match '(\d+)/(\d+) marker') { $script:S.Markers = [int]$Matches[1] }
+        Update-Meter
+        Render
 
         if ([Console]::KeyAvailable) {
             $k = [Console]::ReadKey($true)
-            if ($k.Key -eq "F8" -or $k.Key -eq "T") { Switch-Theme; Render }
+            ifif ($k.Key -eq "UpArrow")   { $script:S.Follow = $false; Move-Cursor -1 }
+            elseif ($k.Key -eq "DownArrow") { $script:S.Follow = $false; Move-Cursor  1 }
+            elseif ($k.Key -eq "PageUp")    { $script:S.Follow = $false; Move-Cursor (-1 * (Get-VisibleRows)) }
+            elseif ($k.Key -eq "PageDown")  { $script:S.Follow = $false; Move-Cursor (Get-VisibleRows) }
+            elseif ($k.Key -eq "Home")      { $script:S.Follow = $false; $script:S.Cursor = 0 }
+            elseif ($k.Key -eq "End")       { $script:S.Follow = $false
+                                              $script:S.Cursor = [math]::Max(0, $script:S.Parts.Count - 1) }
+            elseif ($k.Key -eq "F")         { $script:S.Follow = $true }
             elseif ($k.Key -eq "Escape") {
                 try { $proc.Kill() } catch { }
                 $script:S.Message = "Aborted by user"
                 break
             }
         }
+
+        # The list follows the part being recorded until you scroll yourself;
+        # after that it stays where you put it.
+        if ($script:S.Follow -and $script:S.CurPart -gt 0) {
+            $script:S.Cursor = $script:S.CurPart - 1
+        }
+
+        Start-Sleep -Milliseconds 120
     }
-    try { $proc.WaitForExit() } catch { }
-    $script:S.Phase = "done"; $script:S.PassPct = 100
+
+    if ($sub) { Unregister-Event -SubscriptionId $sub.Id -ErrorAction SilentlyContinue }
+    try { $proc.WaitForExit(2000) } catch { }
+    $script:S.Phase = "done"; $script:S.PassPct = 100; $script:S.Rec = $false
     Clear-Screen
+}
+
+# One line of the recorder's output, folded into the display state. Kept apart
+# from the loop so the loop is only about keeping the screen alive.
+function Read-CaptureLine { param([string]$ln)
+    # ">>  3/20  Track 3   ch6  recording -> 03 Track 3" -- printed as the part
+    # STARTS. This is what tells the meter which file to watch.
+    if ($ln -match '^\s*>>\s*(\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)\s+recording\s+->\s+(.+)$') {
+        $n = [int]$Matches[1]
+        if ($n -lt $script:S.CurPart) { return }
+        $script:S.CurPart  = $n
+        $script:S.CurName  = $Matches[3].Trim()
+        $script:S.CurCh    = [int]$Matches[4]
+        $script:S.CurTrack = $Matches[5].Trim()
+        $tot = [int]$Matches[2]
+        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * ($n - 1) / $tot) }
+        $script:S.Message = ""
+        $script:Meter.Path = ""      # new take, new file to follow
+        $script:S.Peak = -999.0
+        $script:S.Rms  = -999.0
+        return
+    }
+    # " 1/20  Track 1   ch1   0:17.70  -> 01 Track 1" -- printed when it ends.
+    # A part's closing line and the next part's opening line are printed back to
+    # back, and the two can reach us in either order. Never let a lower part
+    # number take over: doing so would aim the meter at a file Pro Tools has
+    # already closed, and the level would sit dead for the whole next take.
+    if ($ln -match '^\s+(\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)\s+(\d+:\d+\.\d+)\s+->\s+(.+)$') {
+        $n = [int]$Matches[1]
+        $script:S.Cues += $Matches[5]
+        $tot = [int]$Matches[2]
+        if ($n -lt $script:S.CurPart) { return }
+        $script:S.CurPart  = $n
+        $script:S.CurName  = $Matches[3].Trim()
+        $script:S.CurCh    = [int]$Matches[4]
+        $script:S.CurTrack = $Matches[6].Trim()
+        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * $n / $tot) }
+        $script:S.Message = ""
+        return
+    }
+    if ($ln -match 'FAILED:') { $script:S.Message = $ln.Trim(); return }
+    if ($ln -match 'Mode: one Pro Tools track') { $script:S.Message = "per-track mode"; return }
+
+    if ($ln -match '\[(\d+:\d+\.\d+)\]\s+part (\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)') {
+        $script:S.CurPart = [int]$Matches[2]
+        $script:S.CurName = $Matches[4].Trim()
+        $script:S.CurCh   = [int]$Matches[5]
+        $script:S.Cues   += $Matches[1]
+        $tot = [int]$Matches[3]
+        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * $script:S.CurPart / $tot) }
+    }
+    elseif ($ln -match 'Total pass length:\s+(\S+)') { $script:S.Total = $Matches[1] }
+    elseif ($ln -match 'Done\. (\d+) track\(s\) recorded') {
+        $script:S.Markers = [int]$Matches[1]; $script:S.Message = "$($Matches[1]) track(s) recorded"
+    }
+    elseif ($ln -match 'Done\. (\d+) messages') { $script:S.Sent = [int]$Matches[1] }
+    elseif ($ln -match 'mean lateness ([\d.]+) ms, worst ([\d.]+)') {
+        $script:S.MeanLate = [double]$Matches[1]; $script:S.WorstLate = [double]$Matches[2]
+    }
+    elseif ($ln -match '(\d+)/(\d+) marker') { $script:S.Markers = [int]$Matches[1] }
+}
+
+# ================================================================= picker ===
+#
+# Choosing a song by typing its filename meant knowing the filename. This is a
+# list you drive with the arrow keys; typing narrows it rather than naming it,
+# so a few letters anywhere in the name is enough.
+
+function Picker-Accent { return @((C 'lcyan'), (C 'white'), (C 'dgray')) }
+
+# $Keys feeds keystrokes in place of the keyboard, so the picker can be driven
+# and checked without a console attached.
+function Show-SongPicker { param([object[]]$Keys)
+    $ki = 0
+    $all = @(Get-ChildItem $script:Root -Filter *.mid -ErrorAction SilentlyContinue |
+             Sort-Object Name)
+    if ($all.Count -eq 0) {
+        $script:S.Message = "no .mid files in $($script:Root)"
+        return $null
+    }
+
+    # NOT $pTxt: variable names are case-insensitive here, so a local $pTxt would be
+    # the same variable as the global $pTxt palette table and would replace it with
+    # a colour string -- silently breaking every colour drawn afterwards.
+    $pAcc, $pTxt, $pDim = Picker-Accent
+    $rows = 14
+    $filter = ""
+    $cur = 0
+    # Open on the song already loaded, so re-picking is one keystroke away.
+    if ($script:S.SongFile) {
+        $i = [array]::IndexOf(($all | ForEach-Object { $_.Name }), $script:S.SongFile)
+        if ($i -ge 0) { $cur = $i }
+    }
+    $top = 0
+    # Scripted runs draw inline instead of taking over the screen, so the
+    # picker can be rendered and checked alongside everything else.
+    $scripted = ($null -ne $Keys)
+    if (-not $scripted) { Clear-Screen }
+
+    while ($true) {
+        # Match on plain text, not -like: a bracket in a filename is a wildcard
+        # to -like and would quietly match nothing.
+        $needle = $filter.ToLower()
+        $list = @($all | Where-Object { $_.Name.ToLower().Contains($needle) })
+
+        if ($list.Count -eq 0) { $cur = 0; $top = 0 }
+        else {
+            if ($cur -ge $list.Count) { $cur = $list.Count - 1 }
+            if ($cur -lt 0) { $cur = 0 }
+            if ($cur -lt $top) { $top = $cur }
+            if ($cur -ge $top + $rows) { $top = $cur - $rows + 1 }
+            $lim = [math]::Max(0, $list.Count - $rows)
+            if ($top -gt $lim) { $top = $lim }
+            if ($top -lt 0) { $top = 0 }
+        }
+
+        if (-not $scripted) { Home }
+        Line ""
+        Line ($pAcc + "  SELECT SONG" + $pDim + "   $($script:Root)")
+        Line ($pDim + "  " + (Rep 0x2500 72))
+
+        $shownFilter = "(all)"
+        if ($filter) { $shownFilter = $filter }
+        Line ($pDim + "  find  " + $pAcc + (Plain $shownFilter 30) + $pDim +
+              "$($list.Count) of $($all.Count)")
+        Line ""
+
+        if ($list.Count -eq 0) {
+            Line ($pDim + "    nothing matches " + [char]0x2014 + " Backspace to widen")
+            for ($i = 1; $i -lt $rows; $i++) { Line "" }
+        } else {
+            for ($i = 0; $i -lt $rows; $i++) {
+                $idx = $top + $i
+                if ($idx -ge $list.Count) { Line ""; continue }
+                $f = $list[$idx]
+                $kb = "{0,6:0} KB" -f ($f.Length / 1KB)
+                $when = $f.LastWriteTime.ToString("yyyy-MM-dd HH:mm")
+                if ($idx -eq $cur) {
+                    Line ((CB 'black' 'cyan') + (Plain ("  > " + $f.Name) 46) +
+                          (Plain "$kb   $when" 30) + $RESET)
+                } else {
+                    Line ($pDim + "    " + $pTxt + (Plain $f.Name 42) + $pDim + "$kb   $when")
+                }
+            }
+            $shown = [math]::Min($rows, $list.Count - $top)
+            Line ($pDim + ("    {0}-{1} of {2}" -f ($top + 1), ($top + $shown), $list.Count))
+        }
+
+        Line ""
+        Line ($pDim + "  " + (Rep 0x2500 72))
+        Line ($pDim + "  " + [char]0x2191 + [char]0x2193 + " move   PgUp/PgDn   Home/End   " +
+              "type to filter   Backspace   Enter select   Esc cancel")
+        [Console]::Write("$RESET$E[J")
+
+        # if/elseif rather than switch: inside a switch, 'continue' belongs to
+        # the switch, not to this loop, and the difference is easy to miss.
+        if ($null -ne $Keys) {
+            if ($ki -ge $Keys.Count) { if (-not $scripted) { Clear-Screen }; return $null }
+            $k = $Keys[$ki]; $ki++
+        } else {
+            $k = [Console]::ReadKey($true)
+        }
+        if     ($k.Key -eq "UpArrow")   { $cur-- }
+        elseif ($k.Key -eq "DownArrow") { $cur++ }
+        elseif ($k.Key -eq "PageUp")    { $cur -= $rows }
+        elseif ($k.Key -eq "PageDown")  { $cur += $rows }
+        elseif ($k.Key -eq "Home")      { $cur = 0 }
+        elseif ($k.Key -eq "End")       { $cur = $list.Count - 1 }
+        elseif ($k.Key -eq "Enter") {
+            if ($list.Count -gt 0) { if (-not $scripted) { Clear-Screen }; return $list[$cur].Name }
+        }
+        elseif ($k.Key -eq "Backspace") {
+            if ($filter.Length -gt 0) { $filter = $filter.Substring(0, $filter.Length - 1) }
+        }
+        elseif ($k.Key -eq "Escape") {
+            # Esc clears a filter first, so a mistyped search doesn't throw you
+            # out of the picker entirely.
+            if ($filter) { $filter = "" } else { if (-not $scripted) { Clear-Screen }; return $null }
+        }
+        elseif ("$($k.KeyChar)" -match '^[A-Za-z0-9 ._\-]$') { $filter += $k.KeyChar }
+    }
 }
 
 # =================================================================== demo ===
 
 if ($Demo) {
     Enable-VirtualTerminal
-    if (-not $script:S.SongFile) { $script:S.SongFile = "" }
+    if (-not $script:S.SongFile) { $script:S.SongFile = "TOGEEWIZARD.mid" }
     Update-Device; Update-ProTools; Update-Song
     $script:S.Total = "19:02.94"; $script:S.MeanLate = 0.018; $script:S.WorstLate = 0.811
     $script:S.Markers = 20; $script:S.Sent = 9679; $script:S.PassPct = 41
-    foreach ($t in $THEMES) {
-        $script:S.Theme = $t
-        Line ""
-        Line ((C 'dgray') + ("=" * $W))
-        Line ((C 'yellow') + "  THEME: " + $t.ToUpper())
-        Line ((C 'dgray') + ("=" * $W))
-        switch ($t) {
-            "turbo"    { Render-Turbo }
-            "phosphor" { Render-Phosphor }
-            "ansi"     { Render-Ansi }
-        }
-    }
+    # Mid-pass, so the demo shows what a capture actually looks like.
+    $script:S.Phase = "running"; $script:S.CurPart = 6; $script:S.CurName = "Track 6"
+    $script:S.CurTrack = "06 Track 6"; $script:S.Cursor = 5; $script:S.Rec = $true
+    $script:S.Elapsed = "7:48.10"; $script:S.Peak = -9.4; $script:S.Rms = -21.7
+    $script:S.Levels = @{ 1 = -12.3; 2 = -6.1; 3 = -24.8; 4 = -2.2; 5 = -41.0 }
+    $script:S.Cues = @("0:17.70","1:35.40","2:53.10","4:10.80","5:28.50")
+    Render-Ansi
+    Line ""
+    Line ((C 'dgray') + ("=" * $W))
+    Line ((C 'yellow') + "  SONG PICKER  (F2)")
+    Line ((C 'dgray') + ("=" * $W))
+    $esc = New-Object System.ConsoleKeyInfo(
+        [char]27, [System.ConsoleKey]::Escape, $false, $false, $false)
+    $null = Show-SongPicker -Keys @($esc)
     Line ""
     return
 }
@@ -572,17 +855,11 @@ try {
         Render
         $k = [Console]::ReadKey($true)
         switch ($k.Key) {
-            "F1" { $script:S.Message = "F2 load  F3 region  F5 test  F6 arm  F8 theme  F9 capture  L loops  C clock" }
+            "F1" { $script:S.Message = "F2 song  F3 region  F5 test  F6 arm  F7 verify  A trim  F9 capture  L loops  C clock  " +
+                                       [char]0x2191 + [char]0x2193 + "/PgUp/PgDn/Home/End scroll parts  F follow" }
             "F2" {
-                Show-Cursor; Clear-Screen
-                Write-Host ""
-                Write-Host "  MIDI files in $($script:Root):"
-                Write-Host ""
-                Get-ChildItem $script:Root -Filter *.mid | ForEach-Object { Write-Host "    $($_.Name)" }
-                Write-Host ""
-                $f = Read-Host "  Filename (blank to cancel)"
+                $f = Show-SongPicker
                 if ($f) { $script:S.SongFile = $f; $script:S.Message = ""; Update-Song }
-                Hide-Cursor; Clear-Screen
             }
             "F3" {
                 Show-Cursor; Clear-Screen
@@ -598,13 +875,52 @@ try {
                     $script:S.Message = "Armed $($script:S.PtTrack)"
                 } catch { $script:S.Message = "Arm failed - is Pro Tools running?" }
             }
-            "F8"  { Switch-Theme }
-            "T"   { Switch-Theme }
+            "F7"  {
+                # measure the takes -- you can't listen to an unattended pass
+                Show-Cursor; Clear-Screen
+                & $script:Python $script:Stem verify $script:S.Session
+                Write-Host ""
+                Write-Host "  press a key..." -NoNewline
+                [void][Console]::ReadKey($true)
+                Hide-Cursor; Clear-Screen
+            }
+            "A"   {
+                Show-Cursor; Clear-Screen
+                if (-not $script:S.SongFile) {
+                    Write-Host "`n  Load a song first (F2)."
+                } else {
+                    # Tab to transient, split, delete left, shift left -- with
+                    # --grid so parts that do not begin on beat 1 keep their place.
+                    $mid = Join-Path $script:Root $script:S.SongFile
+                    & $script:Python $script:Stem tab $script:S.Session `
+                        --grid $mid --fill --dry-run
+                    Write-Host ""
+                    $go = Read-Host "  Apply this trim? (y/N)"
+                    if ($go -eq 'y') {
+                        & $script:Python $script:Stem tab $script:S.Session `
+                            --grid $mid --fill --yes
+                    }
+                }
+                Write-Host ""
+                Write-Host "  press a key..." -NoNewline
+                [void][Console]::ReadKey($true)
+                Hide-Cursor; Clear-Screen
+            }
             "F9"  { Start-Capture }
             "F10" { return }
             "Q"   { return }
             "L"   { if ($script:S.Loops -ge 4) { $script:S.Loops = 1 } else { $script:S.Loops++ } }
             "C"   { $script:S.Clock = -not $script:S.Clock }
+
+            # Track list navigation. Each theme shows a different number of
+            # rows, so a page is whatever the current theme can display.
+            "UpArrow"    { Move-Cursor -1 }
+            "DownArrow"  { Move-Cursor  1 }
+            "PageUp"     { Move-Cursor (-1 * (Get-VisibleRows)) }
+            "PageDown"   { Move-Cursor (Get-VisibleRows) }
+            "Home"       { $script:S.Cursor = 0 }
+            "End"        { $script:S.Cursor = [math]::Max(0, $script:S.Parts.Count - 1) }
+
             "Escape" { return }
         }
     }
@@ -614,4 +930,3 @@ finally {
     [Console]::Write($RESET)
     Clear-Screen
 }
-

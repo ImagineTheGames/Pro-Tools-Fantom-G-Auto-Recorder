@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Put a Fantom Stem Capture shortcut on the desktop.
 
@@ -9,7 +9,7 @@
 
 .EXAMPLE
     .\Install-Shortcut.ps1
-    .\Install-Shortcut.ps1 -Song mysong.mid
+    .\Install-Shortcut.ps1 -Song TOGEEWIZARD.mid
 #>
 
 param(
@@ -57,4 +57,3 @@ Write-Host "  Target : $target"
 Write-Host "  Host   : $(if ($wt) { 'Windows Terminal (100x34)' } else { 'PowerShell console' })"
 if ($Song) { Write-Host "  Song   : $Song" }
 Write-Host ""
-

@@ -1,0 +1,10 @@
+{
+  "name": "fantom-stem",
+  "private": true,
+  "type": "module",
+  "description": "Node dependencies for ptools.js, the PTSL client protools.py drives in serve mode.",
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1"
+  }
+}
