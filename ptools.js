@@ -41,6 +41,10 @@ const CMD = {
   TogglePlayState: 64,
   ToggleRecordEnable: 65,
   TrimToSelection: 6,
+  Copy: 21,
+  RenameTargetTrack: 8,
+  GetEditModeOptions: 79,
+  SetEditModeOptions: 80,
   GetEditSelection: 12,
   GetMemoryLocations: 69,
   ClearMemoryLocation: 61,
@@ -260,6 +264,69 @@ async function handle(req) {
     // Separate Clip command; Trim To Selection is Pro Tools' own verb for the
     // same edit -- select from the cut point to the end, and everything before
     // it goes. In Shuffle the survivor packs left to zero on its own.
+    // Copy one timeline range across several tracks and paste it elsewhere,
+    // keeping every track in step. Slip, never Shuffle: in Shuffle a paste
+    // shoves everything after it sideways and the whole session drifts.
+    case "rename-track": {
+      await send(CMD.RenameTargetTrack, {
+        current_name: req.name, new_name: req.to });
+      return { from: req.name, to: req.to };
+    }
+    case "copy-range": {
+      await send(CMD.SetEditMode, { edit_mode: "EMode_Slip" });
+      // Without "Link Track and Edit Selection", selecting 26 tracks does not
+      // widen the edit selection to cover them: the timeline range applies to
+      // whichever single track already held the edit selection. Copy then
+      // takes one track and Paste fills one track, silently.
+      // BOTH links are needed. link_track spreads the selection across the
+      // named tracks; link_timeline is what turns a timeline range into an
+      // edit selection at all. With only the first, Copy/Clear act on nothing.
+      await send(CMD.SetEditModeOptions, {
+        edit_mode_options: {
+          link_track_and_edit_selection: true,
+          link_timeline_and_edit_selection: true } });
+      await send(CMD.SelectTracksByName, { track_names: req.tracks });
+      await send(CMD.SetTimelineSelection, {
+        in_time: String(req.in), out_time: String(req.out),
+        play_start_marker_time: String(req.in) });
+      await send(CMD.Copy, {});
+      return { copied: [req.in, req.out], tracks: req.tracks.length };
+    }
+    // Delete a timeline range on one track, leaving what is before it in
+    // place. Slip, not Shuffle: Shuffle would pull later material backwards.
+    case "clear-range": {
+      await send(CMD.SetEditMode, { edit_mode: "EMode_Slip" });
+      // BOTH links are needed. link_track spreads the selection across the
+      // named tracks; link_timeline is what turns a timeline range into an
+      // edit selection at all. With only the first, Copy/Clear act on nothing.
+      await send(CMD.SetEditModeOptions, {
+        edit_mode_options: {
+          link_track_and_edit_selection: true,
+          link_timeline_and_edit_selection: true } });
+      await send(CMD.SelectTracksByName, { track_names: [req.name] });
+      await send(CMD.SetTimelineSelection, {
+        in_time: String(req.in), out_time: String(req.out),
+        play_start_marker_time: String(req.in) });
+      await send(CMD.Clear, {});
+      return { track: req.name, cleared: [req.in, req.out] };
+    }
+    case "paste-at": {
+      // BOTH links are needed. link_track spreads the selection across the
+      // named tracks; link_timeline is what turns a timeline range into an
+      // edit selection at all. With only the first, Copy/Clear act on nothing.
+      await send(CMD.SetEditModeOptions, {
+        edit_mode_options: {
+          link_track_and_edit_selection: true,
+          link_timeline_and_edit_selection: true } });
+      await send(CMD.SelectTracksByName, { track_names: req.tracks });
+      // A zero-length selection: the paste lands at the insertion and keeps
+      // its own length instead of being squeezed into a highlighted range.
+      await send(CMD.SetTimelineSelection, {
+        in_time: String(req.at), out_time: String(req.at),
+        play_start_marker_time: String(req.at) });
+      await send(CMD.Paste, {});
+      return { pasted_at: req.at, tracks: req.tracks.length };
+    }
     case "separate-head": {
       const cut = String(req.samples === undefined ? 0 : req.samples);
       const end = String(req.end === undefined ? 0 : req.end);

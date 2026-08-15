@@ -104,7 +104,7 @@ function Home         { [Console]::Write("$E[H") }
 $script:S = @{
     SongFile = $Song; SongName = "(none loaded)"
     Bpm = 0.0; Bars = 0.0; TimeSig = "4/4"; Parts = @()
-    Loops = 2; Gap = 2; Region = ""; Clock = $false
+    Loops = 2; Gap = 2; Region = ""; PartSpec = ""; LoopBars = 0; Clock = $false
     PerTrack = $true; Tail = 4.0; CurTrack = ""
     Session = "C:\ProTools\2026\OGWizard"
     Scroll = 0; Cursor = 0; Follow = $true
@@ -342,6 +342,43 @@ function Db-Text { param([double]$Db)
 
 function Get-VisibleRows { return 12 }
 
+# Which part numbers a spec selects. Mirrors parse_parts() in fantom_stem.py:
+# "7", "17-" (17 to the end), "5-8", "-4", or a mixture like "1,3,9-12".
+# Returns $null for "everything", so callers can tell "all" from "none".
+function Expand-PartSpec { param([string]$Spec, [int]$Count)
+    if (-not $Spec -or -not $Spec.Trim()) { return $null }
+    $out = New-Object System.Collections.Generic.List[int]
+    foreach ($tok in $Spec.Split(",")) {
+        $t = $tok.Trim()
+        if (-not $t) { continue }
+        if ($t -match '^(\d*)\s*-\s*(\d*)$') {
+            $lo = if ($Matches[1]) { [int]$Matches[1] } else { 1 }
+            $hi = if ($Matches[2]) { [int]$Matches[2] } else { $Count }
+        } elseif ($t -match '^\d+$') {
+            $lo = [int]$t; $hi = $lo
+        } else {
+            return ,@()         # unreadable: select nothing, and say so
+        }
+        if ($lo -lt 1 -or $hi -gt $Count -or $lo -gt $hi) { return ,@() }
+        for ($i = $lo; $i -le $hi; $i++) { if (-not $out.Contains($i)) { $out.Add($i) } }
+    }
+    return ,$out.ToArray()
+}
+
+# Kill everything that can be making noise, in the order that matters: stop the
+# pass first so it cannot send more notes, then stop the transport, then send
+# note-offs on every channel. Doing the panic first is useless while the pass
+# is still running.
+function Stop-Everything { param($Proc)
+    if ($Proc) { try { if (-not $Proc.HasExited) { $Proc.Kill() } } catch { } }
+    try { & node $script:PTools stop 2>$null | Out-Null } catch { }
+    try { & node $script:PTools disarm-all 2>$null | Out-Null } catch { }
+    try { & $script:Python $script:Stem panic --usb 2>$null | Out-Null } catch { }
+    $script:S.Phase = "done"
+    $script:S.Rec = $false
+    $script:S.Message = "STOPPED - transport stopped, all notes off"
+}
+
 # Keep the cursor on screen: scroll only when it would leave the window.
 function Clamp-Scroll { param([int]$Rows)
     $n = $script:S.Parts.Count
@@ -440,16 +477,31 @@ function Render-Ansi {
     # in Pro Tools, because PTSL has no way to set a session's tempo.
     $bpm = "-- BPM"
     if ($script:S.Bpm -gt 0) { $bpm = "{0:0.##} BPM" -f $script:S.Bpm }
-    $bars = "-"
-    if ($script:S.Bars -gt 0) { $bars = "{0:0.##} bars" -f $script:S.Bars }
+    # The loop length that will actually be used, and whether it was chosen or
+    # worked out from the song.
+    if ($script:S.LoopBars -gt 0) {
+        $bars = "$($script:S.LoopBars) bar loop"
+    } elseif ($script:S.Bars -gt 0) {
+        $bars = "{0:0.##} bar loop" -f [math]::Floor($script:S.Bars)
+    } else {
+        $bars = "- bar loop"
+    }
     $reg = "whole song"
     if ($script:S.Region) { $reg = "bars $($script:S.Region)" }
+    $parts = "all parts"
+    if ($script:S.PartSpec) {
+        $sel = Expand-PartSpec $script:S.PartSpec ([math]::Max(1, $script:S.Parts.Count))
+        $parts = "parts $($script:S.PartSpec)"
+        if ($sel -ne $null) { $parts += " ($($sel.Count))" }
+    }
     Line ("  " + (C 'lmagenta') + $bpm + " " + (C 'dgray') + $dot + " " +
           (C 'white') + $script:S.TimeSig + " " + (C 'dgray') + $dot + " " +
-          (C 'lgray') + $bars + " " + (C 'dgray') + $dot + " " +
+          ((C 'lgray'), (C 'lcyan'))[[int]($script:S.LoopBars -gt 0)] + $bars +
+          " " + (C 'dgray') + $dot + " " +
           (C 'lgray') + "$($script:S.Loops) loops" + " " + (C 'dgray') + $dot + " " +
           (C 'lgray') + "tail $($script:S.Tail)s" + " " + (C 'dgray') + $dot + " " +
-          (C 'lgray') + $reg)
+          (C 'lgray') + $reg + " " + (C 'dgray') + $dot + " " +
+          ((C 'lgray'), (C 'lcyan'))[[int][bool]$script:S.PartSpec] + $parts)
 
     # The pass bar: without it there is no sense of how far in you are.
     $full = 60
@@ -466,6 +518,9 @@ function Render-Ansi {
         Line ((C 'dgray') + "       no song loaded " + [char]0x2014 + " press F2")
     } else {
         $top = Clamp-Scroll $rows
+        # Parts left out by the current spec are dimmed and marked, so the
+        # screen shows what a capture will actually do before it runs.
+        $sel = Expand-PartSpec $script:S.PartSpec $script:S.Parts.Count
         for ($i = 0; $i -lt $rows; $i++) {
             $idx = $top + $i
             if ($idx -ge $script:S.Parts.Count) { Line ""; continue }
@@ -492,9 +547,18 @@ function Render-Ansi {
             }
             $cur = "  "
             if ($idx -eq $script:S.Cursor) { $cur = (C 'lcyan') + [char]0x25BA + " " }
-            Line ($cur + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'white') + (Plain $p.Name 20) +
-                  " " + (C 'lblue') + ("{0,2}" -f $p.Ch) + "   " + (C 'yellow') + (Plain $keep 10) +
-                  " " + (C 'dgray') + (Db-Text $db) + "  " + $meter + "   " + $mark)
+
+            $skip = ($sel -ne $null -and -not ($sel -contains $p.N))
+            if ($skip) {
+                Line ($cur + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'dgray') +
+                      (Plain $p.Name 20) + " " + (C 'dgray') + ("{0,2}" -f $p.Ch) +
+                      "   " + (C 'dgray') + (Plain "skip" 10) + " " + (C 'dgray') +
+                      "  --    " + (C 'dgray') + ("." * 10) + "   " + (C 'dgray') + "-")
+            } else {
+                Line ($cur + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'white') + (Plain $p.Name 20) +
+                      " " + (C 'lblue') + ("{0,2}" -f $p.Ch) + "   " + (C 'yellow') + (Plain $keep 10) +
+                      " " + (C 'dgray') + (Db-Text $db) + "  " + $meter + "   " + $mark)
+            }
         }
         $shown = [math]::Min($rows, $script:S.Parts.Count - $top)
         Line ((C 'dgray') + ("  {0}-{1} of {2}   " -f ($top + 1), ($top + $shown),
@@ -525,6 +589,9 @@ function Render-Ansi {
           (C 'lgreen') + "[F6]" + (C 'lgray') + " arm  " +
           (C 'lgreen') + "[F7]" + (C 'lgray') + " verify  " +
           (C 'lgreen') + "[A]" + (C 'lgray') + " trim  " +
+          (C 'lgreen') + "[N]" + (C 'lgray') + " name  " +
+          (C 'lgreen') + "[P]" + (C 'lgray') + " parts  " +
+          (C 'lgreen') + "[B]" + (C 'lgray') + " bars  " +
           (C 'lgreen') + "[L]" + (C 'lgray') + " loops  " +
           (C 'lgreen') + "[F9]" + (C 'lgray') + " capture  " +
           (C 'lred')   + "[S]"  + (C 'lgray') + " stop  " +
@@ -555,6 +622,8 @@ function Start-Capture {
     if ($script:S.PerTrack) { $a += @("--per-track", "--tail", $script:S.Tail, "--lead", 0) }
     if ($script:S.Clock)    { $a += "--clock" }
     if ($script:S.Region)   { $a += @("--region", $script:S.Region) }
+    if ($script:S.PartSpec) { $a += @("--parts", $script:S.PartSpec) }
+    if ($script:S.LoopBars -gt 0) { $a += @("--bars", $script:S.LoopBars) }
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $script:Python
@@ -562,6 +631,10 @@ function Start-Capture {
         if ("$_" -match '\s') { '"' + $_ + '"' } else { "$_" } }) -join ' ')
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
+    # Python writes tracebacks to stderr. Leaving it unredirected sent every
+    # crash somewhere invisible, so a pass that died on its first line looked
+    # from here exactly like a pass that was still running.
+    $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
 
     # Read the child's output through an event into a queue rather than calling
@@ -574,8 +647,11 @@ function Start-Capture {
     $proc.EnableRaisingEvents = $true
     $sub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived `
         -MessageData $q -Action { if ($null -ne $EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) } }
+    $suberr = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived `
+        -MessageData $q -Action { if ($null -ne $EventArgs.Data) { $Event.MessageData.Enqueue($EventArgs.Data) } }
     [void]$proc.Start()
     $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
 
     $script:S.T0 = Get-Date
     $script:S.Levels = @{}
@@ -619,9 +695,13 @@ function Start-Capture {
             elseif ($k.Key -eq "End")       { $script:S.Follow = $false
                                               $script:S.Cursor = [math]::Max(0, $script:S.Parts.Count - 1) }
             elseif ($k.Key -eq "F")         { $script:S.Follow = $true }
-            elseif ($k.Key -eq "Escape") {
-                try { $proc.Kill() } catch { }
-                $script:S.Message = "Aborted by user"
+            # Every key a person reaches for when they want it to stop. Escape
+            # alone was not enough: mid-pass there was no S, no Q, no F10, so
+            # once a capture was running there was no way out of it.
+            elseif ($k.Key -eq "Escape" -or $k.Key -eq "S" -or $k.Key -eq "Q" -or
+                    $k.Key -eq "F10" -or $k.Key -eq "Spacebar" -or
+                    ($k.Key -eq "C" -and $k.Modifiers -band [ConsoleModifiers]::Control)) {
+                Stop-Everything $proc
                 break
             }
         }
@@ -635,9 +715,43 @@ function Start-Capture {
         Start-Sleep -Milliseconds 120
     }
 
-    if ($sub) { Unregister-Event -SubscriptionId $sub.Id -ErrorAction SilentlyContinue }
+    if ($sub)    { Unregister-Event -SubscriptionId $sub.Id -ErrorAction SilentlyContinue }
+    if ($suberr) { Unregister-Event -SubscriptionId $suberr.Id -ErrorAction SilentlyContinue }
     try { $proc.WaitForExit(2000) } catch { }
     $script:S.Phase = "done"; $script:S.PassPct = 100; $script:S.Rec = $false
+
+    # A pass that dies is the dangerous case, not the tidy one: Pro Tools keeps
+    # recording and the Fantom keeps sounding, because the thing that would
+    # have stopped them is the thing that just died. Matching on message text
+    # was not enough -- a Python traceback puts the file path on the first line
+    # and the actual error several lines down, so the pass looked like it was
+    # still working while nothing was happening. Trust the exit code instead.
+    $code = 0
+    try { $code = $proc.ExitCode } catch { $code = -1 }
+    if ($code -ne 0) {
+        $tail = @($log | Where-Object { "$_".Trim() } | Select-Object -Last 8)
+        # The useful line is the exception, not the stack frame that happens to
+        # be printed last -- and stderr lines can arrive out of order anyway.
+        $last = "no output"
+        if ($tail) {
+            $named = @($tail | Where-Object { "$_" -match '^\s*\w*(Error|Exception)\b|^\s*\w+Error:' })
+            $last = if ($named) { "$($named[-1])".Trim() } else { "$($tail[-1])".Trim() }
+        }
+        Stop-Everything $null
+        $script:S.Message = "ABORTED (exit $code) - $last"
+
+        Show-Cursor; Clear-Screen
+        Line ((C 'lred') + "  CAPTURE FAILED" + (C 'lgray') + "   exit code $code")
+        Line ((C 'dgray') + "  " + (Rep 0x2500 72))
+        foreach ($ln in $tail) { Line ((C 'lgray') + "  " + $ln) }
+        Line ""
+        Line ((C 'dgray') + "  Transport stopped, tracks disarmed, notes off.")
+        Line ""
+        Write-Host "  press a key..." -NoNewline
+        [void][Console]::ReadKey($true)
+        Hide-Cursor; Clear-Screen
+        return
+    }
 
     Show-CaptureReport $log
     Clear-Screen
@@ -674,15 +788,20 @@ function Show-CaptureReport($log) {
 function Read-CaptureLine { param([string]$ln)
     # ">>  3/20  Track 3   ch6  recording -> 03 Track 3" -- printed as the part
     # STARTS. This is what tells the meter which file to watch.
-    if ($ln -match '^\s*>>\s*(\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)\s+recording\s+->\s+(.+)$') {
-        $n = [int]$Matches[1]
+    # Two numbers, and they are not the same: "3/12" is position in this pass,
+    # "[17]" is which part of the song. With --parts they diverge, and using
+    # the position as the part number put every level, mark and highlight on
+    # the wrong row.
+    if ($ln -match '^\s*>>\s*(\d+)/(\d+)\s+\[(\d+)\]\s+(.{1,24}?)\s+ch(\d+)\s+recording\s+->\s+(.+)$') {
+        $pos = [int]$Matches[1]
+        $n   = [int]$Matches[3]
         if ($n -lt $script:S.CurPart) { return }
         $script:S.CurPart  = $n
-        $script:S.CurName  = $Matches[3].Trim()
-        $script:S.CurCh    = [int]$Matches[4]
-        $script:S.CurTrack = $Matches[5].Trim()
+        $script:S.CurName  = $Matches[4].Trim()
+        $script:S.CurCh    = [int]$Matches[5]
+        $script:S.CurTrack = $Matches[6].Trim()
         $tot = [int]$Matches[2]
-        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * ($n - 1) / $tot) }
+        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * ($pos - 1) / $tot) }
         $script:S.Message = ""
         $script:Meter.Path = ""      # new take, new file to follow
         $script:S.Peak = -999.0
@@ -694,20 +813,29 @@ function Read-CaptureLine { param([string]$ln)
     # back, and the two can reach us in either order. Never let a lower part
     # number take over: doing so would aim the meter at a file Pro Tools has
     # already closed, and the level would sit dead for the whole next take.
-    if ($ln -match '^\s+(\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)\s+(\d+:\d+\.\d+)\s+->\s+(.+)$') {
-        $n = [int]$Matches[1]
-        $script:S.Cues += $Matches[5]
+    if ($ln -match '^\s+(\d+)/(\d+)\s+\[(\d+)\]\s+(.{1,24}?)\s+ch(\d+)\s+(\d+:\d+\.\d+)\s+->\s+(.+)$') {
+        $pos = [int]$Matches[1]
+        $n   = [int]$Matches[3]
+        $script:S.Cues += $Matches[6]
         $tot = [int]$Matches[2]
         if ($n -lt $script:S.CurPart) { return }
         $script:S.CurPart  = $n
-        $script:S.CurName  = $Matches[3].Trim()
-        $script:S.CurCh    = [int]$Matches[4]
-        $script:S.CurTrack = $Matches[6].Trim()
-        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * $n / $tot) }
+        $script:S.CurName  = $Matches[4].Trim()
+        $script:S.CurCh    = [int]$Matches[5]
+        $script:S.CurTrack = $Matches[7].Trim()
+        if ($tot -gt 0) { $script:S.PassPct = [int](100.0 * $pos / $tot) }
         $script:S.Message = ""
         return
     }
     if ($ln -match 'FAILED:') { $script:S.Message = $ln.Trim(); return }
+    # A pass that dies before it prints any progress used to leave the screen
+    # showing "starting Pro Tools, then rolling..." forever, which reads as
+    # waiting rather than as the crash it actually was.
+    if ($ln -match 'USB backend:|No such file|Traceback|^\s*\w*Error|not found') {
+        $script:S.Message = "ABORTED - " + $ln.Trim()
+        $script:S.Phase = "done"
+        return
+    }
     if ($ln -match 'Mode: one Pro Tools track') { $script:S.Message = "per-track mode"; return }
 
     if ($ln -match '\[(\d+:\d+\.\d+)\]\s+part (\d+)/(\d+)\s+(.{1,24}?)\s+ch(\d+)') {
@@ -920,50 +1048,90 @@ try {
                 Hide-Cursor; Clear-Screen
             }
             "A"   {
+                # Tab to transient, separate, delete the head, pull to zero --
+                # all of it done by Pro Tools itself through the MCP server.
+                # No song file needed: the transients come from the audio in
+                # the session, not from the MIDI.
                 Show-Cursor; Clear-Screen
-                if (-not $script:S.SongFile) {
-                    Write-Host "`n  Load a song first (F2)."
-                } else {
-                    # Tab to transient, split, delete left, shift left -- with
-                    # --grid so parts that do not begin on beat 1 keep their place.
-                    $mid = Join-Path $script:Root $script:S.SongFile
-                    & $script:Python $script:Stem tab $script:S.Session `
-                        --grid $mid --fill --dry-run
-                    Write-Host ""
-                    $go = Read-Host "  Apply this trim? (y/N)"
-                    if ($go -eq 'y') {
-                        & $script:Python $script:Stem tab $script:S.Session `
-                            --grid $mid --fill --yes
-                    }
-                }
+                & $script:Python $script:Stem tab
                 Write-Host ""
                 Write-Host "  press a key..." -NoNewline
                 [void][Console]::ReadKey($true)
                 Hide-Cursor; Clear-Screen
             }
             "F9"  { Start-Capture }
-            "S"   {
-                # Panic button. A crashed or abandoned capture leaves Pro Tools
-                # rolling and armed, the Fantom sounding, and orphaned
-                # processes. Quitting this console (F10/Q/Esc) does none of
-                # that, which is why this key exists separately.
-                Show-Cursor; Clear-Screen
-                $stop = Join-Path $script:Root "Stop-Capture.ps1"
-                if (Test-Path $stop) {
-                    & powershell -NoProfile -ExecutionPolicy Bypass -File $stop
+            "F10" { return }
+            "Q"   { return }
+            "L"   { if ($script:S.Loops -ge 4) { $script:S.Loops = 1 } else { $script:S.Loops++ } }
+            "C"   { $script:S.Clock = -not $script:S.Clock }
+            # Panic button. Works whether or not this tool started the noise --
+            # a previous run that was killed leaves the transport rolling and
+            # notes held, and nothing in here could clear that before. A
+            # PowerShell switch runs EVERY matching clause, so a second "S"
+            # case here would fire as well as this one, not instead of it.
+            "S"   { Stop-Everything $null; Update-ProTools }
+            "B"   {
+                # Loop length. Auto-detect reads the last note START, which is
+                # right when one part sustains past the loop point -- but the
+                # song is the authority, so this can be set by hand.
+                Show-Cursor
+                $auto = if ($script:S.Bars -gt 0) { [int][math]::Ceiling($script:S.Bars) } else { 8 }
+                Write-Host ""
+                Write-Host ("  Loop length in bars. Empty = auto from the song.")
+                $b = Read-Host "  bars"
+                $b = "$b".Trim()
+                if (-not $b) {
+                    $script:S.LoopBars = 0
+                    $script:S.Message = "loop length: auto from the song"
+                } elseif ($b -match '^\d+$' -and [int]$b -ge 1 -and [int]$b -le 64) {
+                    $script:S.LoopBars = [int]$b
+                    $script:S.Message = "loop length: $b bars"
                 } else {
-                    Write-Host "`n  Stop-Capture.ps1 not found beside this script."
+                    $script:S.Message = "loop length must be 1-64 bars - unchanged"
+                }
+                Hide-Cursor; Clear-Screen
+            }
+            "P"   {
+                # Which parts to capture. The common case is re-recording the
+                # tail of a song after fixing a few sounds, so ranges matter
+                # more than picking individual numbers off a list.
+                Show-Cursor
+                $n = [math]::Max(1, $script:S.Parts.Count)
+                Write-Host ""
+                Write-Host ("  Parts to capture, 1-{0}.  7 | 17- | 5-8 | -4 | 1,3,9-12" -f $n)
+                Write-Host "  Empty for all."
+                $spec = Read-Host "  parts"
+                $spec = "$spec".Trim()
+                if (-not $spec) {
+                    $script:S.PartSpec = ""
+                    $script:S.Message = "capturing all $n parts"
+                } else {
+                    $sel = Expand-PartSpec $spec $n
+                    if ($sel -ne $null -and $sel.Count -eq 0) {
+                        $script:S.Message = "cannot read '$spec' - parts unchanged"
+                    } else {
+                        $script:S.PartSpec = $spec
+                        $script:S.Message = "capturing $($sel.Count) of $n parts: $spec"
+                    }
+                }
+                Hide-Cursor; Clear-Screen
+            }
+            "N"   {
+                # Name the tracks after the Fantom patches, read from the
+                # song's own .SVQ. Needs the song loaded, since that is what
+                # identifies which .SVQ to read.
+                Show-Cursor; Clear-Screen
+                if (-not $script:S.SongFile) {
+                    Write-Host "`n  Load a song first (F2)."
+                } else {
+                    & $script:Python $script:Stem name `
+                        (Join-Path $script:Root $script:S.SongFile)
                 }
                 Write-Host ""
                 Write-Host "  press a key..." -NoNewline
                 [void][Console]::ReadKey($true)
                 Hide-Cursor; Clear-Screen
-                Update-ProTools
             }
-            "F10" { return }
-            "Q"   { return }
-            "L"   { if ($script:S.Loops -ge 4) { $script:S.Loops = 1 } else { $script:S.Loops++ } }
-            "C"   { $script:S.Clock = -not $script:S.Clock }
 
             # Track list navigation. Each theme shows a different number of
             # rows, so a page is whatever the current theme can display.

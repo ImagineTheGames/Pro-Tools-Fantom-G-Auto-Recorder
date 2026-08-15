@@ -25,6 +25,7 @@ import csv
 import ctypes
 import glob
 import json
+import math
 import os
 import re
 import sys
@@ -97,6 +98,8 @@ class Song:
         self.bar_ticks = int(self.ppq * 4 / self.denominator * self.numerator)
         self.parts = self._extract_parts()
         self.end_tick = max((p["max_tick"] for p in self.parts.values()), default=0)
+        self.end_note_tick = max(
+            (p.get("max_note_tick", 0) for p in self.parts.values()), default=0)
 
     def _build_tempo_map(self):
         tempos = []
@@ -178,6 +181,11 @@ class Song:
                 p["max_tick"] = max(p["max_tick"], t)
                 if msg.type == "note_on" and msg.velocity > 0:
                     p["notes"] += 1
+                    # Where the last note STARTS, which is what sets the loop
+                    # length. The last event is usually a note-off well past
+                    # the final bar line, and treating that as musical length
+                    # adds a whole bar of tail to every loop iteration.
+                    p["max_note_tick"] = max(p.get("max_note_tick", 0), t)
                 elif msg.type == "program_change":
                     p["programs"].add(msg.program)
                 elif msg.type == "control_change":
@@ -212,21 +220,55 @@ def panic_all(port):
 
 # -------------------------------------------------------------- schedule ----
 
-def select_parts(song, spec):
-    """spec: None for all, or comma list of 1-based indices into the part list."""
-    keys = list(song.parts.keys())
-    if not spec:
-        return keys
-    chosen = []
-    for token in spec.split(","):
+def parse_parts(spec, count):
+    """
+    Part numbers from a spec, 1-based and in order.
+
+    Accepts single numbers, ranges, and open ranges in any combination:
+
+        7          just part 7
+        17-        part 17 to the end -- capture the rest, skip what came before
+        5-8        parts 5 to 8
+        -4         parts 1 to 4
+        1,3,9-12   any mixture
+
+    Ranges matter because the common case is re-capturing the tail of a song
+    after fixing a few sounds, and listing a dozen numbers by hand is a good
+    way to fat-finger one.
+    """
+    if not spec or not str(spec).strip():
+        return list(range(1, count + 1))
+
+    picked = []
+    for token in str(spec).split(","):
         token = token.strip()
         if not token:
             continue
-        i = int(token) - 1
-        if i < 0 or i >= len(keys):
-            sys.exit("No part %s (there are %d)." % (token, len(keys)))
-        chosen.append(keys[i])
-    return chosen
+        m = re.match(r"^(\d*)\s*-\s*(\d*)$", token)
+        if m:
+            lo = int(m.group(1)) if m.group(1) else 1
+            hi = int(m.group(2)) if m.group(2) else count
+        elif token.isdigit():
+            lo = hi = int(token)
+        else:
+            sys.exit("Cannot read part spec %r. Use 7, 17-, 5-8, -4, or 1,3,9-12."
+                     % token)
+        if lo < 1 or hi > count or lo > hi:
+            sys.exit("Part range %r is outside 1-%d." % (token, count))
+        picked.extend(range(lo, hi + 1))
+
+    seen, out = set(), []
+    for n in picked:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def select_parts(song, spec):
+    """spec: None for all, or a part spec -- see parse_parts."""
+    keys = list(song.parts.keys())
+    return [keys[n - 1] for n in parse_parts(spec, len(keys))]
 
 
 def region_events(part, start_tick, end_tick, send_programs):
@@ -308,14 +350,7 @@ def build_schedule(song, keys, loops, gap_bars, lead_bars, loop_bars, send_progr
         if loop_bars:
             end_tick = int(loop_bars * song.bar_ticks)
         else:
-            # Round the song length to a whole bar. A note-off a few ticks past
-            # the final bar line is normal and must NOT add a whole bar -- that
-            # would append silence to every loop iteration and break the loop.
-            exact = song.end_tick / float(song.bar_ticks)
-            whole = int(exact)
-            if exact - whole > 0.02:
-                whole += 1
-            end_tick = max(1, whole) * song.bar_ticks
+            end_tick = max(1, song_loop_bars(song)) * song.bar_ticks
 
     # seconds measured relative to the region start, so tempo changes before
     # the region don't shift everything
@@ -830,221 +865,298 @@ def cmd_verify(args):
 
 def cmd_tab(args):
     """
-    Tab to transient, split, delete left, shift left -- on every track.
+    Tab to transient, separate, delete the head, pull the clip to zero.
 
-    Pro Tools exposes none of those four operations to scripting: there is no
-    Tab to Transient, no Separate Clip, no nudge. The result is reachable
-    another way. Find the attack in the recorded file, then delete that much
-    from the front of the clip with the session in Shuffle mode, where a
-    deletion ripples everything after it to the left. Splitting, deleting the
-    left half and dragging the right half to zero is one operation once you
-    are in Shuffle, and this is that operation.
+    Pro Tools does the transient detection. PTSL exposes no Tab to Transient,
+    so this used to measure the audio here and guess where Pro Tools would
+    land. It does not work: tuned until it matched one track's manual edit, it
+    cut into the attack of every other track. The MCP server drives Pro Tools'
+    own menu commands, so the answer is Pro Tools' answer.
     """
-    from audio import Take
-    from protools import Session, ProToolsError
+    from ptmcp import ProToolsMcp, McpError
+    from protools import Session
 
-    # --grid keeps parts that do not begin on beat 1 where they belong. Without
-    # it, a part whose first note is a beat into the loop gets that beat pulled
-    # to zero, and it plays a beat early against everything else.
-    midi_start = {}
-    if args.grid:
-        song = Song(args.grid)
-        for i, key in enumerate(song.parts.keys(), start=1):
-            ev = song.parts[key]["events"]
-            first = next((t for t, m in ev if m.type == "note_on" and m.velocity > 0), None)
-            if first is not None:
-                midi_start[i] = song.tick_to_sec(first)
+    # Pro Tools knows which session is open; there is no reason to be told.
+    if not args.session:
+        args.session = session_path_from_protools()
 
-    files = glob.glob(os.path.join(args.session, "**", "*.L.wav"), recursive=True)
-    newest = {}
-    for p in files:
-        stem = os.path.basename(p).split("_")[0]
-        if stem.upper().startswith("ZZ"):
-            continue
-        if stem not in newest or os.path.getmtime(p) > os.path.getmtime(newest[stem]):
-            newest[stem] = p
-    if not newest:
-        sys.exit("No .L.wav files under %s" % args.session)
-
-    def order(stem):
-        m = re.match(r"^(\d+)", stem)
-        return (int(m.group(1)) if m else 999, stem)
-
-    print()
-    print("  %-22s %10s %10s %10s  %s" % (
-        "TRACK", "TRANSIENT", "GRID", "CUT", "NOTE"))
-    print("  " + "-" * 22 + " " + "-" * 10 + " " + "-" * 10 + " " + "-" * 10 + "  " + "-" * 22)
-
-    # How much has already come off each clip. Trimming shortens the clip but
-    # never touches the file, so file length minus clip length is exactly what
-    # a previous run removed -- and the command stays safe to re-run.
     with Session() as pt:
-        clip_len = {}
-        for name, cl in pt.clips().items():
-            if cl:
-                clip_len[name] = max(c[2] for c in cl) - min(c[1] for c in cl)
+        tracks = sorted(
+            (n for n, cl in pt.clips().items() if cl),
+            key=lambda s: (int(re.match(r"^(\d+)", s).group(1))
+                           if re.match(r"^(\d+)", s) else 999, s))
+    if args.tracks:
+        tracks = [t for t in tracks if t in args.tracks]
+    if not tracks:
+        sys.exit("No tracks with clips in this session.")
 
-    plan = []
-    found = []
-    for stem in sorted(newest, key=order):
-        t = Take(newest[stem])
-        # Default to the FOOT of the attack -- the last moment still down in
-        # the noise. Snapping forward to the note's playing level matched one
-        # track and ate the front of the other nineteen: measured against each
-        # track's own level, all twenty had note material in the 40 ms before
-        # the cut. Leaving a few milliseconds of silence is inaudible; removing
-        # the leading edge of every note is not.
-        tr = t.tab_to_transient() if args.snap else t.transient(guard_ms=args.guard)
-        m = re.match(r"^(\d+)", stem)
-        idx = int(m.group(1)) if m else None
-        offset = midi_start.get(idx, 0.0) if args.grid else 0.0
-        if tr is None:
-            plan.append((stem, t, None, offset, "no attack found - skipped"))
-            continue
-        found.append(tr - offset)
-        plan.append((stem, t, tr, offset, ""))
+    try:
+        with ProToolsMcp() as mcp:
+            # Every check in here fails silently at runtime, so a pass that
+            # looks like it worked can have done nothing at all.
+            pre = mcp.preflight()
+            print()
+            print(pre.strip())
+            if "Preflight OK" not in pre:
+                sys.exit("\n  Automation cannot run right now. Fix the above first.")
 
-    if not found:
-        sys.exit("\n  No transient could be measured on any track.")
+            # A warning here is not advisory. A focused floating window
+            # swallows the Tab keystroke; Tab then does nothing, and the
+            # transient comes back as wherever the insertion already was. That
+            # produced cuts ranging from 21 ms to 0.99 s on one recording, and
+            # every one of them looked like a successful trim.
+            # A dry run edits nothing, so a warning must not block it -- being
+            # unable to look is worse than useless when something has gone
+            # wrong and you are trying to find out what.
+            if args.dry_run:
+                print()
+                print(mcp.trim_heads(tracks, max_head=args.max_head,
+                                     dry_run=True).strip())
+                print("\n  Dry run. Re-run without --dry-run to apply.")
+                return
 
-    # The group median is the sanity check: every take came off the same rig,
-    # so a track that wants to cut far more than its neighbours is a detection
-    # failure, not a track that happens to start late.
-    med = sorted(found)[len(found) // 2]
+            # Warnings are printed, not obeyed. Refusing to trim over a
+            # floating window left a whole capture untrimmed and the pass
+            # carried on regardless, which was worse than the risk.
 
-    todo = []
-    skipped = []          # (stem, why) - every one of these gets reported
-    for stem, t, tr, offset, note in plan:
-        # Filtering happens here, not during the scan: the group median is only
-        # meaningful if it was taken across the whole session.
-        if args.tracks and stem not in args.tracks:
-            continue
-        # A take whose track is gone from the session is just a file left on
-        # disk. Editing it is impossible -- but say so, because a track that
-        # silently vanishes from the report is indistinguishable from a bug.
-        if stem not in clip_len:
-            skipped.append((stem, "no clip on the timeline - take file only"))
-            print("  %-22s %10s %10s %10s  not on the timeline"
-                  % (stem[:22], "-", "-", "-"))
-            continue
-        gone = len(t.samples) - clip_len[stem]
-        if tr is None:
-            # --fill: every take came off the same rig at the same latency, so
-            # the group's own median is a better answer for a track whose
-            # attack cannot be seen than leaving it a third of a second late.
-            if args.fill:
-                samples = int(round(med * t.rate)) - gone
-                if samples > 2:
-                    todo.append((stem, samples, samples / float(t.rate)))
-                    print("  %-22s %10s %9.3fs %9.3fs  no attack - group median"
-                          % (stem[:22], "-", offset, samples / float(t.rate)))
-                else:
-                    skipped.append((stem, "no attack found, and already trimmed"))
-                    print("  %-22s %10s %9.3fs %10s  no attack - already trimmed"
-                          % (stem[:22], "-", offset, "-"))
-            else:
-                skipped.append((stem, note or "no attack found"))
-                print("  %-22s %10s %10s %10s  %s" % (stem[:22], "-", "-", "-", note))
-            continue
-        cut = max(0.0, tr - offset)
-        off = cut - med
-        # Off by default. Parts genuinely start at different times -- different
-        # notes, different lengths -- so a cut far from the group median is
-        # normal, not evidence of a bad measurement. Skipping those tracks left
-        # them untrimmed while everything around them moved, which is worse
-        # than trimming them. Pass --tolerance to bring the check back.
-        if args.grid and args.tolerance > 0 and abs(off) > args.tolerance:
-            note = "%+.0f ms vs group - skipped" % (1000.0 * off)
-            skipped.append((stem, note))
-            print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
-            continue
-        samples = int(round(cut * t.rate)) - gone
-        if samples <= 2:
-            if gone > 2:
-                note = "already trimmed %.3fs" % (gone / float(t.rate))
-                if samples < -2:
-                    note += " - %.0f ms PAST this point" % (-1000.0 * samples / t.rate)
-            else:
-                note = "already at zero"
-            skipped.append((stem, note))
-            print("  %-22s %9.3fs %9.3fs %10s  %s" % (stem[:22], tr, offset, "-", note))
-            continue
-        todo.append((stem, samples, samples / float(t.rate)))
-        extra = "" if gone <= 2 else "  (%.3fs already off)" % (gone / float(t.rate))
-        print("  %-22s %9.3fs %9.3fs %9.3fs  %+.0f ms vs group%s"
-              % (stem[:22], tr, offset, samples / float(t.rate), 1000.0 * off, extra))
+            print()
+            done = 0
+            for name in tracks:
+                # One track at a time, checked after each. Trimming all twenty
+                # and looking afterwards means a broken run damages all twenty.
+                with Session() as pt:
+                    before = pt.clip_span(name)
+                out = mcp.trim_heads([name], max_head=args.max_head)
+                pos = parse_transient(out, name)
+                with Session() as pt:
+                    after = pt.clip_span(name)
 
-    print("\n  group median cut %.3f s   %d track(s) to trim" % (med, len(todo)))
+                if pos is None:
+                    print("  %-22s no transient - left alone" % name[:22])
+                    continue
 
-    if args.grid:
-        late = [i for i, v in midi_start.items() if v > 0.05]
-        if late:
-            print("  --grid is on: %d part(s) whose first note is not on beat 1 keep "
-                  "their offset." % len(late))
+                if "skipped" in out:
+                    print("  %-22s transient %7d - server skipped it" % (name[:22], pos))
+                    continue
 
-    if not todo:
-        trim_summary([], skipped, [])
-        return
-    if args.dry_run:
-        print("\n  Dry run. Re-run without --dry-run to apply.")
-        return
-    if not args.yes:
-        print("\n  Add --yes to apply.")
-        return
+                removed = before - after
+                if abs(removed - pos) > 2:
+                    print("\n  %s: Pro Tools reported a transient at %d but the "
+                          "clip lost %d samples." % (name, pos, removed))
+                    sys.exit("  Stopping before this damages the rest of the "
+                             "session. %d track(s) were trimmed." % done)
+                done += 1
+                print("  %-22s transient %7d  removed %7d  ok" % (name[:22], pos, removed))
 
-    print()
-    trimmed, failures = [], []
+            print("\n  %d of %d track(s) trimmed and verified." % (done, len(tracks)))
+    except McpError as e:
+        sys.exit("\n  MCP server: %s" % e)
+
     with Session() as pt:
+        ex = pt.extents()
+    late = {k: v[0] for k, v in ex.items() if v[0] != 0}
+    if late:
+        print("  NOT at zero: %s" % late)
+
+
+def parse_transient(text, name):
+    """The transient position the server reported for one track, or None."""
+    for ln in text.splitlines():
+        if name in ln:
+            m = re.search(r"transient (\d+)|trimmed at (\d+)", ln)
+            if m:
+                return int(m.group(1) or m.group(2))
+    return None
+
+
+def song_loop_bars(song):
+    """
+    The loop length in bars: where the music repeats, not where sound stops.
+
+    Measured from the last note ON. A held chord or a long release runs past
+    the final bar line as note-offs -- this song measures 8.12 bars that way --
+    and rounding that up gave a 9 bar loop for 8 bars of music. Every loop
+    iteration then carried a bar of tail, heard as a bar of silence appearing
+    in music that never had one, and the tail is what --tail already covers.
+
+    Capture and extend both come through here, so the length they use cannot
+    drift apart.
+    """
+    ref = song.end_note_tick or song.end_tick
+    exact = ref / float(song.bar_ticks)
+    whole = int(exact)
+    if exact - whole > 0.02:
+        whole += 1
+    return max(1, whole)
+
+
+def loop_samples(song, bars, rate):
+    """Samples in `bars` bars of this song, at the session's sample rate."""
+    beat = 60.0 / song.tempo_bpm()
+    bar_seconds = beat * (4.0 / song.denominator) * song.numerator
+    return int(round(rate * bar_seconds * bars))
+
+
+def cmd_extend(args):
+    """
+    Repeat the second loop until the session is long enough to work with.
+
+    A capture is two loops: the first still has reverb and delay building up,
+    the second is the loop as it sounds once it has settled. So the second one
+    is what gets repeated -- bars 9-16 of an 8-bar part, and so on.
+
+    Loop length comes from the MIDI's own tempo, not from the Pro Tools ruler.
+    PTSL cannot set session tempo, so the ruler is usually still at whatever
+    the session was created with and its bar lines are in the wrong place.
+    """
+    from protools import Session
+
+    song = Song(args.file)
+    with Session() as pt:
+        rate = 48000
         try:
-            for stem, samples, cut in todo:
-                try:
-                    r = pt.separate_head(stem, samples)
-                    trimmed.append((stem, cut, r["start"]))
-                    print("  %-22s separated at %.3f s, kept the right side, packed to %d"
-                          % (stem[:22], cut, r["start"]))
-                except ProToolsError as e:
-                    failures.append((stem, str(e)))
-                    print("  %-22s FAILED: %s" % (stem[:22], e))
-        finally:
-            # separate_head puts the session in Shuffle so the survivor packs
-            # left on its own. Leaving it there is a trap: the next edit the
-            # user makes by hand ripples the whole timeline.
-            try:
-                pt.edit_mode("EMode_Slip")
-            except Exception as e:
-                print("\n  WARNING: could not restore Slip mode: %s" % e)
-                print("  Pro Tools is still in SHUFFLE - set it back before editing.")
+            sr = str(pt.info().get("sample_rate", {}).get("sample_rate", ""))
+            digits = "".join(c for c in sr if c.isdigit())
+            if digits:
+                rate = int(digits)
+        except Exception:
+            pass
 
-    trim_summary(trimmed, skipped, failures)
+        # --bars comes through as a float from `run` and an int from `extend`.
+        bars = int(args.bars) if args.bars else song_loop_bars(song)
+        loop = loop_samples(song, bars, rate)
+        target = int(args.minutes * 60 * rate)
+        need = int(math.ceil(target / float(loop)))
+
+        ex = pt.extents()
+        tracks = sorted(k for k, v in ex.items() if v[1] > 0)
+        if not tracks:
+            sys.exit("No tracks with clips in this session.")
+        # The SHORTEST track decides how much is already down. Going by the
+        # longest lets one over-extended track convince this that every track
+        # is finished, and the rest stay at their recorded length.
+        #
+        # Rounded, not floored: trimming the head takes a fraction of a second
+        # off, so two recorded loops measure 1.98 and floor called that one.
+        shortest = min(ex[k][1] - ex[k][0] for k in tracks)
+        have = int(round(shortest / float(loop)))
+
+        print()
+        print("  loop      %d bars at %.2f BPM = %d samples (%.2f s)"
+              % (bars, song.tempo_bpm(), loop, loop / float(rate)))
+        print("  target    %.2f min -> %d loops (%.1f s)"
+              % (args.minutes, need, need * loop / float(rate)))
+        print("  have      %d loop(s) across %d track(s)" % (have, len(tracks)))
+
+        # With only one loop recorded there is no settled second pass to copy,
+        # so copy the one there is.
+        src_from, src_to = (loop, 2 * loop) if have >= 2 else (0, loop)
+        if have >= need:
+            print("\n  Already long enough.")
+            return
+        if args.dry_run:
+            print("\n  Would paste %d more loop(s). Re-run without --dry-run."
+                  % (need - have))
+            return
+
+        # Copy once, paste many: the clipboard holds across pastes, and copying
+        # per repetition would re-read the timeline as it grows.
+        pt.send("copy-range", tracks=tracks, **{"in": src_from, "out": src_to})
+        for n in range(have, need):
+            pt.send("paste-at", tracks=tracks, at=n * loop)
+
+        after = pt.extents()
+        longest = max(v[1] for v in after.values())
+        print("\n  %d track(s) now %.1f s (%d loops, %d bars)"
+              % (len(tracks), longest / float(rate), longest // loop,
+                 (longest // loop) * bars))
+
+        # Every track has to have grown. A paste that lands on only one track
+        # still reports success -- which is exactly what happened with "Link
+        # Track and Edit Selection" off: 25 of 26 tracks stayed at their
+        # recorded length and the run looked clean.
+        short = [k for k in tracks
+                 if (after[k][1] - after[k][0]) < longest - loop // 2]
+        if short:
+            print("  WARNING - %d track(s) did not extend: %s"
+                  % (len(short), ", ".join(short[:8])))
 
 
-def trim_summary(trimmed, skipped, failures):
+def cmd_name(args):
     """
-    Say plainly what happened to every track.
+    Name each Pro Tools track after the instrument that was captured onto it.
 
-    Without this the outcome was a single count, and a track that dropped out
-    of the run looked identical to a track that was never there.
+    The names come from the Fantom's own .SVQ song file. The exported SMF has
+    none -- see svq.py for why, and for why the synth cannot be asked directly.
     """
-    print()
-    print("  " + "=" * 58)
-    print("  HEAD TRIM: %d trimmed, %d skipped%s"
-          % (len(trimmed), len(skipped),
-             ", %d FAILED" % len(failures) if failures else ""))
-    print("  " + "=" * 58)
+    import svq
+    from protools import Session
 
-    if trimmed:
-        print("\n  Trimmed:")
-        for stem, cut, start in trimmed:
-            print("    %-24s cut %.3f s  ->  starts at %d" % (stem[:24], cut, start))
-    if skipped:
-        print("\n  Skipped (nothing was changed on these):")
-        for stem, why in skipped:
-            print("    %-24s %s" % (stem[:24], why))
-    if failures:
-        print("\n  FAILED:")
-        for stem, why in failures:
-            print("    %-24s %s" % (stem[:24], why))
-    print()
+    title = os.path.splitext(os.path.basename(args.file))[0]
+    folders = [args.svq_dir, os.path.dirname(os.path.abspath(args.file)),
+               os.path.join(os.path.expanduser("~"), "fantom-recovery", "final")]
+    if args.svq:
+        candidates = [args.svq]
+    else:
+        candidates = svq.find_svq(title, folders)
+    if not candidates:
+        sys.exit("No .SVQ found for '%s'. Pass --svq FILE, or --svq-dir FOLDER."
+                 % title)
+
+    path = candidates[0]
+    names = svq.part_names(path)
+    print("\n  %s\n  %d part(s)" % (path, len(names)))
+    if len(candidates) > 1:
+        print("  (%d other revision(s) found; using the one with the most parts)"
+              % (len(candidates) - 1))
+
+    fixes = svq.load_overrides(args.overrides or
+                               os.path.splitext(args.file)[0] + ".names")
+    if fixes:
+        print("  %d correction(s) applied from the overrides file" % len(fixes))
+        names.update(fixes)
+
+    wanted = svq.track_names(names)
+
+    with Session() as pt:
+        have = set(pt.extents())
+        # Tracks are matched by their leading number, not by position, so a
+        # session with tracks missing or reordered still lines up.
+        by_num = {}
+        for t in have:
+            m = re.match(r"^(\d+)", t)
+            if m:
+                by_num[int(m.group(1))] = t
+
+        print()
+        renamed = skipped = 0
+        for num in sorted(wanted):
+            current = by_num.get(num)
+            if current is None:
+                print("  part %-3d no track in the session" % num)
+                skipped += 1
+                continue
+            if current == wanted[num]:
+                print("  %-22s already named" % current[:22])
+                continue
+            if args.dry_run:
+                print("  %-22s -> %s" % (current[:22], wanted[num]))
+                continue
+            pt.send("rename-track", name=current, to=wanted[num])
+            print("  %-22s -> %s" % (current[:22], wanted[num]))
+            renamed += 1
+
+        if args.dry_run:
+            print("\n  Dry run. Re-run without --dry-run to apply.")
+            return
+
+        # Read the names back: a rename that silently hit nothing still
+        # returns ok, and the point of naming is that the labels are right.
+        after = set(pt.extents())
+        missing = [n for n in wanted.values() if n not in after]
+        print("\n  %d renamed, %d skipped." % (renamed, skipped), end=" ")
+        print("all names present" if not missing
+              else "MISSING: %s" % missing)
 
 
 def cmd_align(args):
@@ -1273,6 +1385,10 @@ def run_per_track(song, keys, args):
     -- but it lands 20 named, stacked stems ready to mix instead of one long
     file to carve up, and every stem shares the same start point.
     """
+    # The part's own number, not its position in the selection. Capturing
+    # `--parts 17-` must record onto tracks 17..20; numbering the selection
+    # from 1 would send them to tracks 01..04 and overwrite the wrong takes.
+    numbers = parse_parts(args.parts, len(song.parts))
     region = parse_region(args.region)
     port, desc = open_output(args)
     print("  Port: %s" % desc)
@@ -1296,14 +1412,14 @@ def run_per_track(song, keys, args):
     try:
         with port:
             panic_all(port)
-            for idx, key in enumerate(keys, start=1):
+            for pos, (idx, key) in enumerate(zip(numbers, keys), start=1):
                 part = song.parts[key]
                 events, cues, total, loop_bars, skipped = build_schedule(
                     song, [key], args.loops, 0, args.lead, args.bars,
                     args.send_programs, region=region, include_empty=args.include_empty)
                 if not cues:
                     print("  %2d/%d  %-22s (no notes in region, skipped)"
-                          % (idx, len(keys), part["name"]))
+                          % (pos, len(keys), part["name"]))
                     continue
                 if args.clock:
                     events = sorted(events + clock_events(
@@ -1317,8 +1433,14 @@ def run_per_track(song, keys, args):
                 # better part of a minute and printed nothing until it was over,
                 # which left anything watching this output with no way to show
                 # what was happening -- or which file to meter.
-                print("  >> %2d/%d  %-22s ch%-3d recording -> %s"
-                      % (idx, len(keys), part["name"], part["channel"] + 1, track),
+                # Both numbers, because they are different things: position in
+                # this pass drives the progress bar, and [part] says which row
+                # of the song it is. With --parts 14- they diverge, and a
+                # reader that assumed one number put every level and highlight
+                # on the wrong track.
+                print("  >> %2d/%d  [%d] %-22s ch%-3d recording -> %s"
+                      % (pos, len(keys), idx, part["name"],
+                         part["channel"] + 1, track),
                       flush=True)
 
                 pt("ensure-track", name=track)
@@ -1357,12 +1479,12 @@ def run_per_track(song, keys, args):
 
                 if failed is not None:
                     print("  %2d/%d  %-22s FAILED: %s"
-                          % (idx, len(keys), part["name"], failed))
+                          % (pos, len(keys), part["name"], failed))
                     print("         Pro Tools stopped. Aborting the pass.")
                     break
                 made += 1
-                print("  %2d/%d  %-22s ch%-3d %s  -> %s"
-                      % (idx, len(keys), part["name"], part["channel"] + 1,
+                print("  %2d/%d  [%d] %-22s ch%-3d %s  -> %s"
+                      % (pos, len(keys), idx, part["name"], part["channel"] + 1,
                          fmt_time(total), track), flush=True)
                 time.sleep(0.35)
     except KeyboardInterrupt:
@@ -1377,17 +1499,19 @@ def run_per_track(song, keys, args):
 
     if made and not args.no_trim:
         trim_after_capture(args)
+    if made and not args.no_extend:
+        extend_after_capture(args)
+    if made and not args.no_name:
+        name_after_capture(args)
 
 
 def trim_after_capture(args):
     """
     Trim every recorded stem to its own first attack, for real.
 
-    Runs the same path as `fantom_stem.py tab`, with --fill and --yes: no dry
-    run, no confirmation, no group-median skipping. A part that starts seconds
-    later than its neighbours is a part that starts later, not a bad
-    measurement, and leaving it untrimmed while everything around it moves is
-    the worse outcome.
+    Runs the same path as `fantom_stem.py tab`: Pro Tools' own Tab to
+    Transient and Separate Clip, driven through the MCP server. No dry run and
+    no confirmation, since the pass has just finished and nobody is watching.
     """
     session = args.session or session_path_from_protools()
     if not session:
@@ -1399,23 +1523,62 @@ def trim_after_capture(args):
 
     ns = argparse.Namespace(
         session=session,
-        grid=args.file,          # parts that do not start on beat 1 keep their offset
-        guard=0.0,
-        snap=False,
-        tolerance=0.0,           # never skip a track for differing from the group
-        fill=True,               # no detectable attack -> cut the group median
+        max_head=0,              # no ceiling: trim to the transient, always
         tracks=None,
+        force=False,             # stop rather than trim blind on a warning
         dry_run=False,
         yes=True,
     )
     try:
         cmd_tab(ns)
+        return True
     except SystemExit as e:
         # cmd_tab exits when nothing is measurable; that must not kill the pass.
         if e.code:
             print("  Head trim: %s" % e.code)
+        return not e.code
     except Exception as e:
         print("  Head trim failed: %s" % e)
+        return False
+
+
+def extend_after_capture(args):
+    """Fill the session out to a usable length once the heads are trimmed."""
+    print("\n  Repeating the second loop to fill out the song...")
+    ns = argparse.Namespace(
+        file=args.file,
+        minutes=args.minutes,
+        bars=args.bars,
+        dry_run=False,
+    )
+    try:
+        cmd_extend(ns)
+    except SystemExit as e:
+        # Nothing to extend must not look like a failed capture.
+        if e.code:
+            print("  Extend: %s" % e.code)
+    except Exception as e:
+        print("  Extend failed: %s" % e)
+
+
+def name_after_capture(args):
+    """Name the tracks after the Fantom patches once the audio is in place."""
+    print("\n  Naming tracks from the Fantom song file...")
+    ns = argparse.Namespace(
+        file=args.file,
+        svq=None,
+        svq_dir=args.svq_dir,
+        overrides=None,          # SONG.names beside the MIDI, if it exists
+        dry_run=False,
+    )
+    try:
+        cmd_name(ns)
+    except SystemExit as e:
+        # No .SVQ for this song is a normal state, not a failed capture.
+        if e.code:
+            print("  Naming: %s" % e.code)
+    except Exception as e:
+        print("  Naming failed: %s" % e)
 
 
 def session_path_from_protools():
@@ -1604,23 +1767,36 @@ def main():
     v.add_argument("--detail", action="store_true", help="full report per take")
     v.set_defaults(func=cmd_verify)
 
+    nm = sub.add_parser("name", help="name Pro Tools tracks after the Fantom patches")
+    nm.add_argument("file", help="the MIDI file that was captured")
+    nm.add_argument("--svq", metavar="FILE", help="use this .SVQ instead of searching")
+    nm.add_argument("--svq-dir", metavar="FOLDER", help="extra folder to search")
+    nm.add_argument("--overrides", metavar="FILE",
+                    help="name corrections (default: SONG.names beside the MIDI)")
+    nm.add_argument("--dry-run", action="store_true", help="show the plan only")
+    nm.set_defaults(func=cmd_name)
+
+    xt = sub.add_parser("extend", help="repeat the second loop to fill out the song")
+    xt.add_argument("file", help="the MIDI file that was captured")
+    xt.add_argument("--minutes", type=float, default=3.5,
+                    help="how long the result should be (default 3.5)")
+    xt.add_argument("--bars", type=int, default=None,
+                    help="bars per loop (default: the same length the capture "
+                         "looped, taken from the song)")
+    xt.add_argument("--dry-run", action="store_true", help="show the plan only")
+    xt.set_defaults(func=cmd_extend)
+
     tb = sub.add_parser("tab", help="tab to transient, split, delete left, shift left")
-    tb.add_argument("session", help="Pro Tools session folder")
-    tb.add_argument("--grid", metavar="SONG.mid",
-                    help="keep parts whose first note is not on beat 1 in place")
-    tb.add_argument("--guard", type=float, default=0.0,
-                    help="milliseconds to leave in front of the attack (default 0)")
-    tb.add_argument("--snap", action="store_true",
-                    help="cut at the note's playing level rather than the foot of "
-                         "its attack; tighter, but it removes the leading edge")
-    tb.add_argument("--tolerance", type=float, default=0.0,
-                    help="skip tracks whose cut differs from the group median by "
-                         "more than this many seconds. 0 (the default) never "
-                         "skips: every track is trimmed to its own attack")
-    tb.add_argument("--fill", action="store_true",
-                    help="for tracks with no detectable attack, cut the group median")
+    tb.add_argument("session", nargs="?",
+                    help="Pro Tools session folder (default: ask Pro Tools)")
+    tb.add_argument("--max-head", type=int, default=0,
+                    help="ceiling in samples; 0 (the default) means no ceiling, "
+                         "so every track is trimmed to its transient wherever "
+                         "that falls")
     tb.add_argument("--tracks", metavar="NAME", nargs="+",
                     help="only these track names")
+    tb.add_argument("--force", action="store_true",
+                    help="trim even though preflight raised warnings")
     tb.add_argument("--dry-run", action="store_true", help="show the plan only")
     tb.add_argument("--yes", action="store_true", help="apply the trims")
     tb.set_defaults(func=cmd_tab)
@@ -1648,7 +1824,9 @@ def main():
 
     def common(p):
         p.add_argument("file")
-        p.add_argument("--parts", help="comma list of part numbers, e.g. 1,3,7 (default all)")
+        p.add_argument("--parts",
+                   help="which parts to capture: 7, 17- (17 to the end), 5-8, "
+                        "-4, or a mixture like 1,3,9-12 (default all)")
         p.add_argument("--loops", type=int, default=3,
                        help="loop iterations per part; keep the last (default 3)")
         p.add_argument("--gap", type=float, default=2,
@@ -1706,6 +1884,18 @@ def main():
                    help="leave the capture lead at the head of every take. By default a "
                         "finished pass trims each stem to its own first attack and packs "
                         "it to timeline zero")
+    r.add_argument("--no-name", action="store_true",
+                   help="leave the Pro Tools track names alone. By default a "
+                        "finished pass names each track after the Fantom patch "
+                        "it captured, read from the song's .SVQ file")
+    r.add_argument("--svq-dir", metavar="FOLDER",
+                   help="extra folder to search for the .SVQ song file")
+    r.add_argument("--no-extend", action="store_true",
+                   help="leave the session at its recorded length. By default a "
+                        "finished pass repeats the second loop until the song is "
+                        "--minutes long")
+    r.add_argument("--minutes", type=float, default=3.5,
+                   help="how long to make the song after capture (default 3.5)")
     r.add_argument("--session", metavar="FOLDER",
                    help="Pro Tools session folder, for the post-capture trim. Asked of "
                         "Pro Tools directly when not given")

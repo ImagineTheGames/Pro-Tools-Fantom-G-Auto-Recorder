@@ -126,6 +126,11 @@ class Session(object):
                 res[name] = (min(c[1] for c in cl), max(c[2] for c in cl))
         return res
 
+    def clip_span(self, name):
+        """Total samples a track's clips cover, 0 if it has none."""
+        ext = self.extents().get(name)
+        return 0 if ext is None else ext[1] - ext[0]
+
     def edit_selection(self):
         """Which track currently holds the edit selection, if any."""
         for t in self.tracks():
