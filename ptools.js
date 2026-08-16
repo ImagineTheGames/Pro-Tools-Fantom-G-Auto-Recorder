@@ -43,6 +43,10 @@ const CMD = {
   TrimToSelection: 6,
   Copy: 21,
   RenameTargetTrack: 8,
+  CreateSession: 0,
+  OpenSession: 1,
+  SaveSession: 18,
+  GetSessionName: 42,
   GetEditModeOptions: 79,
   SetEditModeOptions: 80,
   GetEditSelection: 12,
@@ -176,6 +180,40 @@ async function handle(req) {
       const r = await send(CMD.GetSessionPath);
       const file = (r.session_path && r.session_path.path) || "";
       return { path: file, folder: file ? path.dirname(file) : "" };
+    }
+    case "save": {
+      await send(CMD.SaveSession, {});
+      return { saved: true };
+    }
+    // A session per song, from a template so the I/O setup comes with it --
+    // which is also what keeps a stray Loopback path from being handed to a
+    // newly created track.
+    case "new-session": {
+      // Leaving input_output_settings out defaults it to the "unknown" enum
+      // value, and CreateSession then reports success and creates nothing.
+      const body = {
+        session_name: req.name,
+        session_location: req.location,
+        file_type: "FType_WAVE",
+        sample_rate: "SR_" + String(req.rate || 48000),
+        bit_depth: "BDepth_" + String(req.depth || 24),
+        input_output_settings: req.io || "IO_Last",
+        is_interleaved: req.interleaved === undefined ? true : !!req.interleaved,
+        is_cloud_project: false,
+        create_from_template: !!req.template,
+      };
+      if (req.template) {
+        body.template_group = req.template_group || "";
+        body.template_name = req.template;
+      }
+      await send(CMD.CreateSession, body);
+      const n = await send(CMD.GetSessionName).catch(() => ({}));
+      return { created: req.name, now_open: n.session_name || "" };
+    }
+    case "open-session": {
+      await send(CMD.OpenSession, { session_path: req.path });
+      const n = await send(CMD.GetSessionName).catch(() => ({}));
+      return { now_open: n.session_name || "" };
     }
     case "ensure-track": {
       const cur = await send(CMD.GetTrackList, { page_limit: 400 });

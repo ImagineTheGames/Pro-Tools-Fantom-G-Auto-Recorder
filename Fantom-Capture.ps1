@@ -173,9 +173,13 @@ function Update-Song {
     if ($out -match 'Time sig:\s+(\d+/\d+)')   { $script:S.TimeSig = $Matches[1] }
     $parts = @()
     foreach ($ln in ($out -split "`n")) {
-        if ($ln -match '^\s+(\d+)\s\s(.{1,24}?)\s{2,}(\d+)\s+(\d+)\s+([\d.]+)') {
+        # Loop is the sixth column: what this part will be captured at, which
+        # is not always the song's length -- a song can hold 4 bar parts under
+        # 8 bar ones. Optional, so an older inspect still parses.
+        if ($ln -match '^\s+(\d+)\s\s(.{1,24}?)\s{2,}(\d+)\s+(\d+)\s+([\d.]+)(?:\s+(\d+))?') {
             $parts += ,@{ N=[int]$Matches[1]; Name=$Matches[2].Trim(); Ch=[int]$Matches[3]
-                          Notes=[int]$Matches[4]; Bars=[double]$Matches[5] }
+                          Notes=[int]$Matches[4]; Bars=[double]$Matches[5]
+                          Loop=$(if ($Matches[6]) { [int]$Matches[6] } else { 0 }) }
         }
     }
     $script:S.Parts  = $parts
@@ -511,7 +515,7 @@ function Render-Ansi {
     Line ("  " + (C 'lcyan') + (Rep 0x2588 $done) + (C 'dgray') + (Rep 0x2591 ($full - $done)) +
           " " + (C 'white') + ("{0,3}%" -f $script:S.PassPct))
     Line ((C 'dgray') + "  " + (Rep 0x2500 72))
-    Line ((CB 'black' 'lcyan') + (Plain "  #   PART                  CH   KEEP AT      dBFS  LEVEL        MARK" $W))
+    Line ((CB 'black' 'lcyan') + (Plain "  #   PART                  CH  BARS   KEEP AT      dBFS  LEVEL      MARK" $W))
 
     $rows = 12
     if ($script:S.Parts.Count -eq 0) {
@@ -548,16 +552,25 @@ function Render-Ansi {
             $cur = "  "
             if ($idx -eq $script:S.Cursor) { $cur = (C 'lcyan') + [char]0x25BA + " " }
 
+            # The loop length this part is captured at. Set by hand it applies
+            # to everything; otherwise each part carries its own, and a part
+            # that differs from the rest of the song is worth seeing.
+            $lb = if ($script:S.LoopBars -gt 0) { $script:S.LoopBars } else { [int]$p.Loop }
+            $bars = if ($lb -gt 0) { "{0,2}b" -f $lb } else { " -" }
+
             $skip = ($sel -ne $null -and -not ($sel -contains $p.N))
             if ($skip) {
                 Line ($cur + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'dgray') +
                       (Plain $p.Name 20) + " " + (C 'dgray') + ("{0,2}" -f $p.Ch) +
-                      "   " + (C 'dgray') + (Plain "skip" 10) + " " + (C 'dgray') +
-                      "  --    " + (C 'dgray') + ("." * 10) + "   " + (C 'dgray') + "-")
+                      "  " + (C 'dgray') + (Plain $bars 5) + " " +
+                      (C 'dgray') + (Plain "skip" 10) + " " + (C 'dgray') +
+                      "  --    " + (C 'dgray') + ("." * 10) + "  " + (C 'dgray') + "-")
             } else {
                 Line ($cur + (C 'dgray') + ("{0:00}" -f $p.N) + "  " + (C 'white') + (Plain $p.Name 20) +
-                      " " + (C 'lblue') + ("{0,2}" -f $p.Ch) + "   " + (C 'yellow') + (Plain $keep 10) +
-                      " " + (C 'dgray') + (Db-Text $db) + "  " + $meter + "   " + $mark)
+                      " " + (C 'lblue') + ("{0,2}" -f $p.Ch) + "  " +
+                      (C 'lmagenta') + (Plain $bars 5) + " " +
+                      (C 'yellow') + (Plain $keep 10) +
+                      " " + (C 'dgray') + (Db-Text $db) + "  " + $meter + "  " + $mark)
             }
         }
         $shown = [math]::Min($rows, $script:S.Parts.Count - $top)
@@ -593,7 +606,7 @@ function Render-Ansi {
           (C 'lgreen') + "[P]" + (C 'lgray') + " parts  " +
           (C 'lgreen') + "[B]" + (C 'lgray') + " bars  " +
           (C 'lgreen') + "[L]" + (C 'lgray') + " loops  " +
-          (C 'lgreen') + "[F9]" + (C 'lgray') + " capture  " +
+          (C 'lgreen') + "[R]" + (C 'lgray') + " record  " +
           (C 'lred')   + "[S]"  + (C 'lgray') + " stop  " +
           (C 'lgreen') + "[F10]" + (C 'lgray') + " quit")
 }
@@ -1018,7 +1031,7 @@ try {
         Render
         $k = [Console]::ReadKey($true)
         switch ($k.Key) {
-            "F1" { $script:S.Message = "F2 song  F3 region  F5 test  F6 arm  F7 verify  A trim  F9 capture  S stop  L loops  C clock  " +
+            "F1" { $script:S.Message = "F2 song  F3 region  F5 test  F6 arm  F7 verify  A trim  N name  P parts  B bars  R record  S stop  L loops  C clock  " +
                                        [char]0x2191 + [char]0x2193 + "/PgUp/PgDn/Home/End scroll parts  F follow" }
             "F2" {
                 $f = Show-SongPicker
@@ -1059,7 +1072,9 @@ try {
                 [void][Console]::ReadKey($true)
                 Hide-Cursor; Clear-Screen
             }
+            # R to record, S to stop. F9 still works.
             "F9"  { Start-Capture }
+            "R"   { Start-Capture }
             "F10" { return }
             "Q"   { return }
             "L"   { if ($script:S.Loops -ge 4) { $script:S.Loops = 1 } else { $script:S.Loops++ } }

@@ -14,37 +14,79 @@ This list is derived from the code, not from memory. To regenerate it:
 
 ## Trimming heads to the first transient
 
-**This exists. Do not rebuild it.**
+**This exists. Do not rebuild it, and do not measure the audio to do it.**
 
 | Where | What |
 | --- | --- |
 | **automatic** | A finished `run --per-track` pass trims every stem it recorded. No dry run, no prompt. `--no-trim` opts out |
-| `fantom_stem.py tab` | Tab to transient, split, delete left, shift left — on every track |
-| `fantom_stem.py align` | Trim the capture lead so bar 1 lands on bar 1 |
-| Console key `A` | Runs `tab` with `--grid`, shows a dry run, asks before applying |
+| `fantom_stem.py tab` | Tab to transient, separate, delete the head, pull to zero. Takes no session path -- it asks Pro Tools |
+| Console key `A` | Runs `tab` immediately |
+| `ptmcp.py trim_heads()` | The MCP call that does it |
+| `ptmcp.py preflight()` | Whether the Windows-level automation can work at all right now |
 | `protools.py separate_head()` | Separate at a sample, drop the left side, pack right to zero |
 | `protools.py trim_head()` | Trim N samples off the head, verified against the EDL |
-| `audio.py Take.transient()` | Attack detection in the recorded file |
-| `audio.py Take.tab_to_transient()` | Snap to the attack the way Pro Tools' Tab does |
-| `audio.py Take.onset()` | First sample above the noise floor |
+| `fantom_stem.py align` | Trim a shared capture lead, using the smallest in the group |
 
 Notes that matter:
 
-- The trim runs in **Shuffle mode**, where deleting the head ripples
-  everything after it left. That is one operation, not separate → delete →
-  drag.
-- `--grid <song.mid>` keeps parts that do not start on beat 1 where they
-  belong. Without it, a part whose first note is a beat into the loop gets
-  pulled to zero and plays early against everything else.
+- **Pro Tools finds the transient, this tool does not.** PTSL has no Tab to
+  Transient, so an earlier version measured the WAV and predicted where
+  Pro Tools would land. Tuned to match one hand edit, it cut into the attack
+  of the other nineteen. The MCP server drives the real menu command.
+- **A focused floating Pro Tools window swallows the Tab keystroke.** Tab
+  then does nothing and the transient comes back as wherever the insertion
+  already was -- cuts from 21 ms to 0.99 s, every one looking clean.
+  `pt_preflight` warns; it no longer refuses, because refusing left a whole
+  capture untrimmed while the pass carried on regardless.
+- **No head ceiling by default** (`--max-head 0`). Whether a late transient is
+  a soft attack or dead air is a judgement about the music.
+- Tracks are trimmed **one at a time** and each is checked against the session
+  before the next, so a bad run damages one track rather than thirty. A
+  server *skip* is a deliberate refusal, not a failure, and does not abort the
+  run -- treating it as one once left sixteen tracks untouched.
 - `align` trims by the **smallest** lead in the cluster, never the mean, so
   it can never cut into the earliest part.
-- Detection reads the recorded WAV. It does not depend on driving the
-  Pro Tools UI.
-- Every track gets trimmed to its own attack. `--tolerance` defaults to 0,
-  which never skips: parts genuinely start at different times, and leaving
-  one untrimmed while everything around it moves is the worse outcome.
-- The session folder is asked of Pro Tools (`session-path`), so the trim
-  finds its own audio files without being told where they are.
+
+## Extending to a usable length
+
+| Where | What |
+| --- | --- |
+| **automatic** | A finished pass repeats the settled loop up to `--minutes` (default 3.5). `--no-extend` opts out |
+| `fantom_stem.py extend song.mid` | The same, on demand |
+| Console key `B` | Override the loop length for the whole song |
+| `fantom_stem.py part_loop_bars()` | How long one part loops |
+| `fantom_stem.py song_loop_bars()` | The base length, being the one most parts share |
+
+- Loop length is measured from the last note **START**. A held release
+  crossing the final bar line is not another bar of music -- reading the last
+  *event* gave a 9 bar loop for 8 bars of music and put a bar of tail inside
+  every iteration.
+- Parts may differ. Longer parts round up to a whole multiple, shorter parts
+  keep their length if it divides the base evenly and is at least half of it.
+  Anything else rounds up.
+- Groups are measured in units of the **shortest** loop. Rounding each group
+  from the tempo separately cannot line up -- an odd sample count halves to
+  a fraction and the groups drift apart.
+- Copy, paste and clear force **both** edit-selection links on. Without
+  `link_timeline` a timeline range is not an edit selection at all; without
+  `link_track` it covers one track. A paste once reached 1 of 26 tracks and
+  reported success.
+
+## Naming tracks from the Fantom song file
+
+| Where | What |
+| --- | --- |
+| **automatic** | A finished pass names every track it recorded. `--no-name` opts out |
+| `fantom_stem.py name song.mid` | The same, on demand |
+| Console key `N` | Runs it |
+| `svq.py part_names()` | Patch name per part from a `.SVQ` |
+| `svq.py find_svq()` | Locate the song file, matching on alphanumerics only |
+| `svq.py track_names()` | Dedup and number repeated patches |
+| `svq.py load_overrides()` | `SONG.names` corrections beside the MIDI |
+
+The exported SMF carries no track names, no programs and no banks. The synth
+answers an Identity Request but ignores Data Requests, so the file is the
+only source.
 
 ## Capture
 
@@ -107,10 +149,16 @@ gone.
 Runs two ways. `protools.py` starts it in **serve** mode and speaks JSON over
 stdin/stdout, which keeps one registered PTSL session alive.
 
-Serve commands: `arm`, `clear-markers`, `clip-extent`, `disarm-all`,
-`edit-mode`, `edl`, `ensure-track`, `locate`, `marker`, `markers`, `quit`,
-`record`, `redo`, `select-clips`, `separate-head`, `shift-left`, `stop`,
-`tempo`, `tracks-state`, `transport`, `trim-head`, `undo`.
+Serve commands: `arm`, `clear-markers`, `clear-range`, `clip-extent`,
+`copy-range`, `disarm-all`, `edit-mode`, `edl`, `ensure-track`, `locate`,
+`marker`, `markers`, `new-session`, `open-session`, `paste-at`, `quit`,
+`record`, `redo`, `rename-track`, `save`, `select-clips`, `separate-head`,
+`session-path`, `shift-left`, `spot`, `stop`, `tempo`, `tracks-state`,
+`transport`, `trim-head`, `undo`.
+
+`new-session` must pass `input_output_settings` or `CreateSession` reports
+success and creates nothing. `spot` accepts invalid clip IDs and silently
+does nothing, so it is not a way to restore clips.
 
 One-shot CLI: `info`, `tracks`, `create-track`, `select`, `record-arm`,
 `input-monitor`, `transport-arm`, `armed`, `play`, `record`, `stop`,
@@ -123,8 +171,13 @@ toggle in PTSL, so firing blind starts what you meant to stop.
 ## Console (`Fantom-Capture.ps1`)
 
     [F2] song   [F3] region  [F5] device  [F6] arm    [F7] verify
-    [A]  trim   [L] loops    [C] clock    [F9] capture
-    [S]  stop   [F10] quit   [F] follow   arrows/PgUp/PgDn/Home/End scroll
+    [A]  trim   [N] name     [P] parts    [B] bars    [L] loops
+    [C]  clock  [R] record   [S] stop     [F10] quit
+    [F]  follow  arrows/PgUp/PgDn/Home/End scroll
+
+`R` records and `S` stops. During a capture, `Esc`, `Q`, `F10`, `Space` and
+`Ctrl+C` all stop as well -- mid-pass there was once no way out at all.
+`A_RunFantomCapture.bat` launches the console without right-clicking.
 
 ## Hardware and diagnostics
 
@@ -142,5 +195,11 @@ toggle in PTSL, so firing blind starts what you meant to stop.
 
 - Nothing here trims **imported** material safely. The trim assumes a
   recorded take whose head is silence.
+- Songs cannot be switched on the Fantom remotely: Song Select is ignored.
+- Nothing arrives back over the Fantom's own USB port, in either direction
+  tested. Use a 5-pin interface if you need MIDI in.
+- Empty Fantom tracks are not exported, so part numbers shift against the
+  instrument after any gap.
+- Session tempo has no PTSL command and must be set by hand.
 - `ptools.js` needs `node_modules` beside it (`npm install`, see README).
 - Windows only: raw USB MIDI plus PTSL on localhost.

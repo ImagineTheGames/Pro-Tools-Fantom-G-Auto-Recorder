@@ -21,6 +21,7 @@ Split the recording at the bar positions in the generated cue sheet.
 """
 
 import argparse
+import collections
 import csv
 import ctypes
 import glob
@@ -969,6 +970,53 @@ def parse_transient(text, name):
     return None
 
 
+def bars_for_tick(song, tick):
+    """
+    Whole bars covering a note that STARTS at `tick`.
+
+    The bar containing the note counts, so this is floor + 1: a last note
+    beginning exactly on the downbeat of bar 16 makes a 16 bar loop, not 15.
+    Songs whose final note falls a little before the line hid that off-by-one
+    -- 7.94 bars rounds to 8 either way -- and a part starting its last note
+    on the downbeat came back a whole bar short.
+    """
+    if tick <= 0:
+        return 1
+    return max(1, int(tick // song.bar_ticks) + 1)
+
+
+def part_loop_bars(song, key):
+    """
+    How long THIS part loops, in bars: a whole multiple of the song's base.
+
+    Parts in one song do not have to share a length -- a song can have two
+    16 bar parts over a bed of 8 bar ones -- and forcing one length either
+    truncates the long parts or gives the short ones half an iteration of
+    silence.
+
+    A shorter part is kept only when it divides the base evenly -- 4 into 8 is
+    a four bar loop that repeats twice, and looping it at 8 would leave four
+    bars of silence in every iteration. A length that fits neither way, like
+    5 against a base of 8, is a part that stops early rather than a 5 bar
+    loop, and looping it at 5 would drag it out of time; those round up.
+
+    Everything therefore stays a whole multiple or divisor of the base, which
+    is what keeps the parts aligned with each other on the timeline.
+
+    Halving is as short as it goes. A part holding one hit near the start
+    measures a single bar, and repeating that every bar turns one crash into
+    eight; a sparse part is far likelier than a one bar loop. Use --bars, or
+    B in the console, for a song where that is genuinely wrong.
+    """
+    base = song_loop_bars(song)
+    own = bars_for_tick(song, song.parts[key].get("max_note_tick", 0))
+    if own >= base:
+        return base * int(math.ceil(own / float(base)))
+    if base % own == 0 and own * 2 >= base:
+        return own
+    return base
+
+
 def song_loop_bars(song):
     """
     The loop length in bars: where the music repeats, not where sound stops.
@@ -981,13 +1029,17 @@ def song_loop_bars(song):
 
     Capture and extend both come through here, so the length they use cannot
     drift apart.
+
+    The base is the length MOST parts share, not the longest. Taking the
+    longest lets two 16 bar parts stretch the other thirty-four to 16 and give
+    each of them eight bars of silence per iteration.
     """
-    ref = song.end_note_tick or song.end_tick
-    exact = ref / float(song.bar_ticks)
-    whole = int(exact)
-    if exact - whole > 0.02:
-        whole += 1
-    return max(1, whole)
+    lengths = [bars_for_tick(song, p.get("max_note_tick", 0))
+               for p in song.parts.values() if p.get("max_note_tick")]
+    if not lengths:
+        return max(1, bars_for_tick(song, song.end_note_tick or song.end_tick))
+    common = collections.Counter(lengths).most_common(1)[0][0]
+    return max(1, common)
 
 
 def loop_samples(song, bars, rate):
@@ -1048,22 +1100,63 @@ def cmd_extend(args):
               % (args.minutes, need, need * loop / float(rate)))
         print("  have      %d loop(s) across %d track(s)" % (have, len(tracks)))
 
-        # With only one loop recorded there is no settled second pass to copy,
-        # so copy the one there is.
-        src_from, src_to = (loop, 2 * loop) if have >= 2 else (0, loop)
+        # Group the tracks by how long THEIR part loops. A song can hold two
+        # 16 bar parts over a bed of 8 bar ones; repeating everything at one
+        # spacing would either double up the long parts or leave the short
+        # ones half empty. Whole multiples stay aligned on the timeline.
+        keys = list(song.parts.keys())
+        groups = {}
+        for k in tracks:
+            head = k.split()[0]
+            n = int(head) if head.isdigit() else 0
+            if args.bars:
+                b = int(args.bars)
+            elif 1 <= n <= len(keys):
+                b = part_loop_bars(song, keys[n - 1])
+            else:
+                b = bars
+            groups.setdefault(b, []).append(k)
+
+        if len(groups) > 1:
+            print("  lengths   %s" % ", ".join(
+                "%d bars x%d" % (b, len(v)) for b, v in sorted(groups.items())))
+
         if have >= need:
             print("\n  Already long enough.")
             return
         if args.dry_run:
-            print("\n  Would paste %d more loop(s). Re-run without --dry-run."
+            print("\n  Would paste up to %d more loop(s). Re-run without --dry-run."
                   % (need - have))
             return
 
-        # Copy once, paste many: the clipboard holds across pastes, and copying
-        # per repetition would re-read the timeline as it grows.
-        pt.send("copy-range", tracks=tracks, **{"in": src_from, "out": src_to})
-        for n in range(have, need):
-            pt.send("paste-at", tracks=tracks, at=n * loop)
+        # Measure every group in units of the SHORTEST one, so the lengths are
+        # exact whole multiples of each other. Rounding each group's loop from
+        # the tempo separately cannot line up: an 8 bar loop of 1123891
+        # samples is odd, so a 4 bar loop is 561945.5 and the two drift apart
+        # by a sample every iteration.
+        unit_bars = min(groups)
+        unit = loop_samples(song, unit_bars, rate)
+        widest = max(groups) // unit_bars          # units in the longest loop
+
+        # Round the target up to something every group can reach exactly, so
+        # they all finish on the same sample.
+        need_units = int(math.ceil((args.minutes * 60 * rate) / float(unit)))
+        need_units = int(math.ceil(need_units / float(widest))) * widest
+        target_len = need_units * unit
+
+        for b, group in sorted(groups.items()):
+            mult = b // unit_bars
+            g_loop = unit * mult
+            g_have = int(round(min(ex[k][1] - ex[k][0] for k in group) / float(g_loop)))
+            g_need = need_units // mult
+            if g_have >= g_need:
+                continue
+            # With only one loop recorded there is no settled second pass to
+            # copy, so copy the one there is.
+            src = (g_loop, 2 * g_loop) if g_have >= 2 else (0, g_loop)
+            pt.send("copy-range", tracks=group, **{"in": src[0], "out": src[1]})
+            for n in range(g_have, g_need):
+                pt.send("paste-at", tracks=group, at=n * g_loop)
 
         after = pt.extents()
         longest = max(v[1] for v in after.values())
@@ -1305,16 +1398,18 @@ def cmd_inspect(args):
     print("  Length:      %.2f bars / %s" % (
         song.bars(song.end_tick), fmt_time(song.tick_to_sec(song.end_tick))))
     print()
-    print("  #  Part                     Ch   Notes   Bars   PC     CCs used")
-    print("  -- ------------------------ ---- ------- ------ ------ ------------------")
+    print("  #  Part                     Ch   Notes   Bars   Loop   PC     CCs used")
+    print("  -- ------------------------ ---- ------- ------ ------ ------ -----------")
     for i, (key, p) in enumerate(song.parts.items(), start=1):
         pcs = ",".join(str(x) for x in sorted(p["programs"])) or "-"
         ccs = ",".join(str(x) for x in sorted(p["ccs"])[:6]) or "-"
         if len(p["ccs"]) > 6:
             ccs += ",..."
-        print("  %2d  %-24s %-4d %-7d %-6.1f %-6s %s" % (
+        # Loop is what this part will actually be captured at, which is not
+        # always the song's length -- see part_loop_bars.
+        print("  %2d  %-24s %-4d %-7d %-6.1f %-6d %-6s %s" % (
             i, p["name"][:24], p["channel"] + 1, p["notes"],
-            song.bars(p["max_tick"]), pcs, ccs))
+            song.bars(p["max_tick"]), part_loop_bars(song, key), pcs, ccs))
     print()
 
     empties = [i for i, (_, p) in enumerate(song.parts.items(), 1) if p["notes"] == 0]
@@ -1414,8 +1509,10 @@ def run_per_track(song, keys, args):
             panic_all(port)
             for pos, (idx, key) in enumerate(zip(numbers, keys), start=1):
                 part = song.parts[key]
+                # Each part loops at its own length unless one was set by hand.
+                part_bars = args.bars or part_loop_bars(song, key)
                 events, cues, total, loop_bars, skipped = build_schedule(
-                    song, [key], args.loops, 0, args.lead, args.bars,
+                    song, [key], args.loops, 0, args.lead, part_bars,
                     args.send_programs, region=region, include_empty=args.include_empty)
                 if not cues:
                     print("  %2d/%d  %-22s (no notes in region, skipped)"
