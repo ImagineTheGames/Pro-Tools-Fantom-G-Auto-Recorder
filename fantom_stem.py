@@ -970,6 +970,21 @@ def parse_transient(text, name):
     return None
 
 
+def first_clip_len(clips, track, fallback):
+    """
+    Length of the first clip on a track -- the take, not the whole extent.
+
+    Anything sitting after it is leftover from an earlier pass and has nothing
+    to do with this recording.
+    """
+    cs = [c for c in clips.get(track, []) if c[0].endswith(".L")]
+    if not cs:
+        cs = clips.get(track, [])
+    if not cs:
+        return fallback
+    return min(cs, key=lambda c: c[1])[3]
+
+
 def bars_for_tick(song, tick):
     """
     Whole bars covering a note that STARTS at `tick`.
@@ -1081,6 +1096,7 @@ def cmd_extend(args):
         need = int(math.ceil(target / float(loop)))
 
         ex = pt.extents()
+        clips = pt.clips()
         tracks = sorted(k for k, v in ex.items() if v[1] > 0)
         if not tracks:
             sys.exit("No tracks with clips in this session.")
@@ -1090,7 +1106,8 @@ def cmd_extend(args):
         #
         # Rounded, not floored: trimming the head takes a fraction of a second
         # off, so two recorded loops measure 1.98 and floor called that one.
-        shortest = min(ex[k][1] - ex[k][0] for k in tracks)
+        shortest = min(first_clip_len(clips, k, ex[k][1] - ex[k][0])
+                       for k in tracks)
         have = int(round(shortest / float(loop)))
 
         print()
@@ -1147,14 +1164,40 @@ def cmd_extend(args):
         for b, group in sorted(groups.items()):
             mult = b // unit_bars
             g_loop = unit * mult
-            g_have = int(round(min(ex[k][1] - ex[k][0] for k in group) / float(g_loop)))
             g_need = need_units // mult
+
+            # The take is the FIRST clip, not the track's extent. A track can
+            # carry leftovers from an earlier pass sitting after the take, and
+            # measuring start-of-first to end-of-last counted those as part of
+            # the recording -- a 27.8 s take read as 51.2 s, the loop length
+            # was inferred from the wrong number, and every paste came from
+            # the wrong place.
+            recorded = min(first_clip_len(clips, k, ex[k][1] - ex[k][0])
+                           for k in group)
+            g_have = int(round(recorded / float(g_loop)))
             if g_have >= g_need:
                 continue
-            # With only one loop recorded there is no settled second pass to
+            rec_loop = min([g_loop, loop], key=lambda c: abs(recorded - 2 * c))
+
+            # With only one iteration recorded there is no settled pass to
             # copy, so copy the one there is.
-            src = (g_loop, 2 * g_loop) if g_have >= 2 else (0, g_loop)
+            settled = recorded >= 2 * rec_loop - g_loop // 2
+            src = ((rec_loop, rec_loop + g_loop) if settled else (0, g_loop))
             pt.send("copy-range", tracks=group, **{"in": src[0], "out": src[1]})
+
+            # Repeats begin where the recorded loops end -- a take of two
+            # 4 bar loops is bars 1-8, so the first paste lands on bar 9.
+            #
+            # Clear from there to the end of the track first. What sits past
+            # the last whole loop is the ring-out tail, and sometimes a clip
+            # left over from an earlier pass; pasting around them leaves a
+            # ragged few bars between the take and the first repeat.
+            start_at = g_have * g_loop
+            for k in group:
+                end = ex[k][1]
+                if end > start_at:
+                    pt.send("clear-range", name=k, **{"in": start_at, "out": end})
+
             for n in range(g_have, g_need):
                 pt.send("paste-at", tracks=group, at=n * g_loop)
 
@@ -1209,7 +1252,8 @@ def cmd_name(args):
         print("  %d correction(s) applied from the overrides file" % len(fixes))
         names.update(fixes)
 
-    wanted = svq.track_names(names)
+    # The patch name replaces the whole track name, number included.
+    wanted = svq.track_names(names, prefix=args.number)
 
     with Session() as pt:
         have = set(pt.extents())
@@ -1665,6 +1709,7 @@ def name_after_capture(args):
         file=args.file,
         svq=None,
         svq_dir=args.svq_dir,
+        number=False,
         overrides=None,          # SONG.names beside the MIDI, if it exists
         dry_run=False,
     )
@@ -1868,6 +1913,8 @@ def main():
     nm.add_argument("file", help="the MIDI file that was captured")
     nm.add_argument("--svq", metavar="FILE", help="use this .SVQ instead of searching")
     nm.add_argument("--svq-dir", metavar="FOLDER", help="extra folder to search")
+    nm.add_argument("--number", action="store_true",
+                    help="keep the part number in front of the patch name")
     nm.add_argument("--overrides", metavar="FILE",
                     help="name corrections (default: SONG.names beside the MIDI)")
     nm.add_argument("--dry-run", action="store_true", help="show the plan only")
