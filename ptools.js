@@ -675,6 +675,10 @@ async function main() {
       console.log(JSON.stringify({ located: s }));
       break;
     }
+    case 'session-path': {
+      console.log(JSON.stringify(await handle({ cmd: 'session-path' }), null, 2));
+      break;
+    }
     case 'markers': {
       const r = await handle({ cmd: 'markers' });
       console.log(`${r.count} memory location(s):`);

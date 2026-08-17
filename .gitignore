@@ -15,3 +15,6 @@ node_modules/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Studio-specific hook: NAS paths and private tooling. Never committed.
+Fantom-Local.ps1

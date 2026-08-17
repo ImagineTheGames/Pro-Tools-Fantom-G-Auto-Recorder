@@ -29,6 +29,11 @@ $script:Python = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.e
 $script:Stem   = Join-Path $script:Root "fantom_stem.py"
 $script:PTools = "C:\Users\Rei\protools-mcp-server\ptools.js"
 
+# Anything specific to one studio -- NAS paths, private tooling -- lives
+# in this file, which the repository does not track. Absent is normal.
+$script:LocalHook = Join-Path $script:Root "Fantom-Local.ps1"
+if (Test-Path $script:LocalHook) { . $script:LocalHook }
+
 # ============================================================== primitives ==
 
 $E = [char]27
@@ -605,6 +610,7 @@ function Render-Ansi {
           (C 'lgreen') + "[N]" + (C 'lgray') + " name  " +
           (C 'lgreen') + "[P]" + (C 'lgray') + " parts  " +
           (C 'lgreen') + "[B]" + (C 'lgray') + " bars  " +
+          (C 'lgreen') + "[U]" + (C 'lgray') + " sync  " +
           (C 'lgreen') + "[L]" + (C 'lgray') + " loops  " +
           (C 'lgreen') + "[R]" + (C 'lgray') + " record  " +
           (C 'lred')   + "[S]"  + (C 'lgray') + " stop  " +
@@ -1085,6 +1091,24 @@ try {
             # PowerShell switch runs EVERY matching clause, so a second "S"
             # case here would fire as well as this one, not instead of it.
             "S"   { Stop-Everything $null; Update-ProTools }
+            "U"   {
+                # Post-capture hook. Whatever you do with a finished session --
+                # push it to a NAS, run a backup, kick off a render -- lives in
+                # your own Fantom-Local.ps1, which this repo does not track.
+                Show-Cursor; Clear-Screen
+                if (Get-Command Invoke-FantomPostCapture -ErrorAction SilentlyContinue) {
+                    Invoke-FantomPostCapture
+                } else {
+                    Write-Host ""
+                    Write-Host "  No post-capture hook configured."
+                    Write-Host "  Create Fantom-Local.ps1 beside this script defining"
+                    Write-Host "  function Invoke-FantomPostCapture { ... }"
+                }
+                Write-Host ""
+                Write-Host "  press a key..." -NoNewline
+                [void][Console]::ReadKey($true)
+                Hide-Cursor; Clear-Screen
+            }
             "B"   {
                 # Loop length. Auto-detect reads the last note START, which is
                 # right when one part sustains past the loop point -- but the
